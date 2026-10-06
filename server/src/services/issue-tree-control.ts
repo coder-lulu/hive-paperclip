@@ -23,19 +23,15 @@ import {
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import type { IssuePostCommitAction } from "./issues.js";
+import {
+  getActivePauseHoldGate as readActivePauseHoldGate,
+  type ActiveIssueTreePauseHoldGate,
+} from "./issue-checkout-admission.js";
 
 type IssueRow = typeof issues.$inferSelect;
 type HoldRow = typeof issueTreeHolds.$inferSelect;
 type HoldMemberRow = typeof issueTreeHoldMembers.$inferSelect;
-export type ActiveIssueTreePauseHoldGate = {
-  holdId: string;
-  rootIssueId: string;
-  issueId: string;
-  isRoot: boolean;
-  mode: "pause";
-  reason: string | null;
-  releasePolicy: IssueTreeHoldReleasePolicy | null;
-};
+export type { ActiveIssueTreePauseHoldGate } from "./issue-checkout-admission.js";
 type ActorInput = {
   actorType: "user" | "agent" | "system";
   actorId: string;
@@ -72,7 +68,6 @@ type RestoreTreeStatusResult = TreeStatusUpdateResult & {
 const TERMINAL_ISSUE_STATUSES = new Set<IssueStatus>(["done", "cancelled"]);
 const ACTIVE_RUN_STATUSES = ["queued", "running"] as const;
 const DEFAULT_RELEASE_POLICY: IssueTreeHoldReleasePolicy = { strategy: "manual" };
-const MAX_PAUSE_HOLD_ANCESTOR_DEPTH = 100;
 export const ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS: ReadonlySet<string> = new Set([
   "issue_commented",
   "issue_reopened_via_comment",
@@ -569,56 +564,7 @@ export function issueTreeControlService(db: Db) {
     companyId: string,
     issueId: string,
   ): Promise<ActiveIssueTreePauseHoldGate | null> {
-    const activePauseHolds = await db
-      .select({
-        id: issueTreeHolds.id,
-        rootIssueId: issueTreeHolds.rootIssueId,
-        reason: issueTreeHolds.reason,
-        releasePolicy: issueTreeHolds.releasePolicy,
-      })
-      .from(issueTreeHolds)
-      .where(
-        and(
-          eq(issueTreeHolds.companyId, companyId),
-          eq(issueTreeHolds.status, "active"),
-          eq(issueTreeHolds.mode, "pause"),
-        ),
-      )
-      .orderBy(asc(issueTreeHolds.createdAt), asc(issueTreeHolds.id));
-    if (activePauseHolds.length === 0) return null;
-
-    const holdByRootIssueId = new Map(activePauseHolds.map((hold) => [hold.rootIssueId, hold]));
-    let currentIssueId: string | null = issueId;
-    const visited = new Set<string>();
-
-    while (
-      currentIssueId
-      && !visited.has(currentIssueId)
-      && visited.size < MAX_PAUSE_HOLD_ANCESTOR_DEPTH
-    ) {
-      visited.add(currentIssueId);
-      const hold = holdByRootIssueId.get(currentIssueId);
-      if (hold) {
-        return {
-          holdId: hold.id,
-          rootIssueId: hold.rootIssueId,
-          issueId,
-          isRoot: hold.rootIssueId === issueId,
-          mode: "pause",
-          reason: hold.reason,
-          releasePolicy: (hold.releasePolicy as IssueTreeHoldReleasePolicy | null) ?? null,
-        };
-      }
-
-      const parent: { parentId: string | null } | null = await db
-        .select({ parentId: issues.parentId })
-        .from(issues)
-        .where(and(eq(issues.id, currentIssueId), eq(issues.companyId, companyId)))
-        .then((rows) => rows[0] ?? null);
-      currentIssueId = parent?.parentId ?? null;
-    }
-
-    return null;
+    return readActivePauseHoldGate(db, companyId, issueId);
   }
 
   async function preview(
