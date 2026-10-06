@@ -1,5 +1,71 @@
+import {
+  nowDate,
+  assertActorProvenance,
+  assertJsonSize,
+  isTerminalKind,
+  terminalKindForStage,
+  writeCaseEvent,
+} from "./pipeline-case-events.js";
+import {
+  hasValidLease,
+  leaseOwner,
+  actorOwnsLease,
+  conflictDetailsForCase,
+  getPipelineOrThrow,
+  getStageOrThrow,
+  getStageByKeyOrThrow,
+  getCaseWithStageOrThrow,
+  getCaseWithStageForUpdateOrThrow,
+  expireLeaseIfNeeded,
+  getCaseOrThrow,
+  assertValidParentCase,
+} from "./pipeline-case-state.js";
+import { readBreakdownCarryOverPolicy, readBreakdownConfig } from "./pipeline-stage-breakdown.js";
+import {
+  stageConfig,
+  normalizeStageConfig,
+  reviewConfigForStage,
+  assertStageEnabled,
+} from "./pipeline-stage-config.js";
+import {
+  readOptionalTrimmedString,
+  readAutomationExecutionContext,
+  stageAutomation,
+  enqueueStageAutomationLedger,
+} from "./pipeline-stage-ledger.js";
+import { listUnresolvedDriftEvents } from "./pipeline-case-gates.js";
+import {
+  adjustParentCounts,
+  computeCaseRollup,
+  getAncestorCases,
+  handleBlockersResolved,
+} from "./pipeline-case-rollups.js";
+import { buildCaseDeepLink } from "./pipeline-case-drift.js";
+import { handleChildrenTerminal } from "./pipeline-case-children.js";
+import {
+  transitionCaseMutationInTransaction as transitionCaseInTransaction,
+} from "./pipeline-case-transition.js";
+import { patchCaseContentInTransaction } from "./pipeline-case-content.js";
+import { reviewCaseMutationInTransaction } from "./pipeline-case-review.js";
+import type {
+  PipelineActor,
+  PipelineStageKind,
+  PipelineStageConfig,
+  PipelineReviewDecision,
+  PipelineDb,
+  PipelineBreakdownConfig,
+  PipelineCarryOverPolicy,
+  PipelineAutomationExecutionContext,
+} from "./pipeline-case-types.js";
+export type {
+  PipelineActor,
+  PipelineStageKind,
+  PipelineStageConfig,
+  PipelineReviewDecision,
+  PipelineBreakdownConfig,
+  PipelineCarryOverPolicy,
+} from "./pipeline-case-types.js";
 import { randomUUID } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
@@ -61,7 +127,6 @@ const DEFAULT_LEASE_MS = 15 * 60 * 1000;
 const MAX_LEASE_MS = 24 * 60 * 60 * 1000;
 const MAX_CASE_KEY_LENGTH = 1024;
 const MAX_BATCH_INGEST = 200;
-const MAX_FIELDS_BYTES = 64 * 1024;
 const PIPELINE_WRITE_PERMISSION = "pipelines:write";
 const PIPELINE_CASE_BODY_CASE_DOCUMENT_KEY = "body";
 const PIPELINE_CASE_BODY_DOCUMENT_TITLE = "Item body document";
@@ -95,99 +160,22 @@ const DEFAULT_STAGES = [
   { key: "cancelled", name: "Cancelled", kind: "cancelled", position: 1000 },
 ] as const;
 
-export type PipelineActor =
-  | { type: "user"; userId: string }
-  | { type: "agent"; agentId: string; runId: string }
-  | { type: "system" };
 
-export type PipelineStageKind = "open" | "working" | "review" | "done" | "cancelled";
 type CanonicalPipelineStageKind = Exclude<PipelineStageKind, "open">;
 
-export type PipelineStageConfig = Record<string, unknown> & {
-  autonomy?: "manual" | "suggest" | "auto";
-  autoAdvanceOnChildrenTerminal?: string;
-  approveToStageKey?: string;
-  rejectToStageKey?: string;
-  requestChangesToStageKey?: string;
-  requireRejectReason?: boolean;
-  requireRequestChangesReason?: boolean;
-  requireChildrenTerminal?: boolean;
-  requireNoUnresolvedDrift?: boolean;
-  disabled?: boolean;
-  requireApproval?: boolean;
-  approver?: {
-    kind?: "any_human" | "user" | "agent";
-    id?: string;
-  };
-  reviewerKind?: "human" | "any";
-  variables?: Array<{
-    name?: unknown;
-    key?: unknown;
-    label?: unknown;
-    type?: unknown;
-    defaultValue?: unknown;
-    options?: unknown;
-    required?: unknown;
-    showInAddForm?: unknown;
-    source?: unknown;
-  }>;
-  automation?: {
-    routineId?: string | null;
-    assigneeAgentId?: string | null;
-    titleTemplate?: string | null;
-    instructionsBody?: string | null;
-    projectId?: string | null;
-    projectWorkspaceId?: string | null;
-    executionWorkspaceId?: string | null;
-    executionWorkspacePreference?: ExecutionWorkspaceMode | null;
-    executionWorkspaceSettings?: IssueExecutionWorkspaceSettings | null;
-    env?: Record<string, EnvBinding> | null;
-    latestRoutineRevisionId?: string | null;
-    latestRoutineRevisionNumber?: number;
-  };
-  breakdown?: {
-    targetPipelineId?: unknown;
-    targetStageKey?: unknown;
-    pieceNoun?: unknown;
-    carryOverPolicy?: unknown;
-    inheritFields?: unknown;
-    advanceTo?: unknown;
-    waitForPieces?: unknown;
-    whenFinishedMoveTo?: unknown;
-  };
-  onEnter?: {
-    type?: "run_routine";
-    routineId?: string;
-    id?: string;
-    projectId?: string | null;
-    projectWorkspaceId?: string | null;
-    executionWorkspaceId?: string | null;
-    executionWorkspacePreference?: ExecutionWorkspaceMode | null;
-    executionWorkspaceSettings?: IssueExecutionWorkspaceSettings | null;
-  };
-};
 
-export type PipelineReviewDecision = "approve" | "reject" | "request_changes";
 
 export type PipelineAutomationExecutionResult =
   | { status: "none" }
   | { status: "succeeded"; execution: typeof pipelineAutomationExecutions.$inferSelect }
   | { status: "failed"; execution: typeof pipelineAutomationExecutions.$inferSelect };
 
-type PipelineDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 type PipelineRetryPlanInternal = PipelineAutomationRetryPlan & {
   targetStageRow: typeof pipelineStages.$inferSelect | null;
   automationRoutineId: string | null;
 };
 
-type PipelineAutomationExecutionContext = {
-  projectId: string | null;
-  projectWorkspaceId: string | null;
-  executionWorkspaceId: string | null;
-  executionWorkspacePreference: ExecutionWorkspaceMode | null;
-  executionWorkspaceSettings: IssueExecutionWorkspaceSettings | null;
-};
 
 export interface ResolvedPipelineCaseConversationSource {
   issue: typeof issues.$inferSelect;
@@ -235,9 +223,6 @@ class PipelinePermissionPreflightError extends HttpError {
   }
 }
 
-function nowDate() {
-  return new Date();
-}
 
 function documentActorFields(actor: PipelineActor) {
   return {
@@ -562,22 +547,7 @@ function routineActorPatch(actor: PipelineActor) {
   return { agentId: null, userId: null, runId: null };
 }
 
-function eventActorPatch(actor: PipelineActor) {
-  if (actor.type === "agent") {
-    assertActorProvenance(actor);
-    return { actorType: "agent", actorAgentId: actor.agentId, runId: actor.runId };
-  }
-  if (actor.type === "user") {
-    return { actorType: "user", actorUserId: actor.userId };
-  }
-  return { actorType: "system" };
-}
 
-function eventActorPayload(actor: PipelineActor) {
-  if (actor.type === "agent") return { type: "agent", agentId: actor.agentId, runId: actor.runId };
-  if (actor.type === "user") return { type: "user", userId: actor.userId };
-  return { type: "system" };
-}
 
 function activityActorPatch(actor: PipelineActor) {
   if (actor.type === "agent") {
@@ -590,11 +560,6 @@ function activityActorPatch(actor: PipelineActor) {
   return { actorType: "system" as const, actorId: "pipeline-automation", agentId: null, runId: null };
 }
 
-function assertActorProvenance(actor: PipelineActor) {
-  if (actor.type === "agent" && !actor.runId) {
-    throw unprocessable("Agent pipeline mutations require a run id", { code: "run_id_required" });
-  }
-}
 
 function assertCaseKey(caseKey: string) {
   if (caseKey.length > MAX_CASE_KEY_LENGTH) {
@@ -602,129 +567,18 @@ function assertCaseKey(caseKey: string) {
   }
 }
 
-function assertJsonSize(value: unknown, label: string) {
-  const bytes = Buffer.byteLength(JSON.stringify(value ?? {}), "utf8");
-  if (bytes > MAX_FIELDS_BYTES) {
-    throw unprocessable(`${label} must be at most 64KB`, { code: "validation" });
-  }
-}
 
-function isTerminalKind(kind: string | null | undefined) {
-  return kind === "done" || kind === "cancelled";
-}
 
-function terminalKindForStage(kind: string) {
-  return isTerminalKind(kind) ? kind : null;
-}
 
-function hasValidLease(row: typeof pipelineCases.$inferSelect, now = nowDate()) {
-  return Boolean(row.leaseToken && row.leaseExpiresAt && row.leaseExpiresAt.getTime() > now.getTime());
-}
 
-function leaseOwner(row: typeof pipelineCases.$inferSelect) {
-  if (row.leaseOwnerType === "agent") {
-    return { type: "agent", agentId: row.leaseAgentId, expiresAt: row.leaseExpiresAt };
-  }
-  if (row.leaseOwnerType === "user") {
-    return { type: "user", userId: row.leaseUserId, expiresAt: row.leaseExpiresAt };
-  }
-  return { type: row.leaseOwnerType, expiresAt: row.leaseExpiresAt };
-}
 
-function actorOwnsLease(row: typeof pipelineCases.$inferSelect, actor: PipelineActor, leaseToken?: string | null) {
-  if (!row.leaseToken) return true;
-  if (leaseToken && leaseToken === row.leaseToken) return true;
-  if (actor.type === "system") return true;
-  if (actor.type === "agent") return row.leaseOwnerType === "agent" && row.leaseAgentId === actor.agentId;
-  if (actor.type === "user") return row.leaseOwnerType === "user" && row.leaseUserId === actor.userId;
-  return false;
-}
 
-function conflictDetailsForCase(row: typeof pipelineCases.$inferSelect, stage?: typeof pipelineStages.$inferSelect | null) {
-  return {
-    code: "version_conflict",
-    version: row.version,
-    stage: stage ? { id: stage.id, key: stage.key, kind: stage.kind } : { id: row.stageId },
-  };
-}
 
-function stageConfig(stage: typeof pipelineStages.$inferSelect): PipelineStageConfig {
-  return (stage.config ?? {}) as PipelineStageConfig;
-}
 
-export interface PipelineBreakdownConfig {
-  targetPipelineId: string;
-  targetStageKey: string;
-  pieceNoun: string;
-  carryOverPolicy: PipelineCarryOverPolicy;
-  inheritFields: string[];
-  advanceTo: string | null;
-  waitForPieces: boolean;
-  whenFinishedMoveTo: string | null;
-}
 
-export interface PipelineCarryOverPolicy {
-  version: 1;
-  mode: "all_except" | "only";
-  includeFields: string[];
-  excludeFields: string[];
-}
 
-function readOptionalStageKey(value: unknown, label: string) {
-  if (value === undefined || value === null || value === "") return null;
-  if (typeof value !== "string" || value.trim().length === 0) {
-    throw unprocessable(`${label} must be a non-empty string`, { code: "validation" });
-  }
-  return value.trim();
-}
 
-function readStringList(value: unknown, label: string) {
-  if (value === undefined || value === null) return [];
-  if (!Array.isArray(value)) throw unprocessable(`${label} must be an array`, { code: "validation" });
-  const seen = new Set<string>();
-  return value.flatMap((entry) => {
-    if (typeof entry !== "string" || entry.trim().length === 0) {
-      throw unprocessable(`${label} entries must be non-empty strings`, { code: "validation" });
-    }
-    const key = entry.trim();
-    if (seen.has(key)) return [];
-    seen.add(key);
-    return [key];
-  });
-}
 
-function readBreakdownCarryOverPolicy(raw: NonNullable<PipelineStageConfig["breakdown"]>): PipelineCarryOverPolicy {
-  const policy = raw.carryOverPolicy;
-  if (policy !== undefined && policy !== null) {
-    if (!policy || typeof policy !== "object" || Array.isArray(policy)) {
-      throw unprocessable("Breakdown carryOverPolicy must be an object", { code: "validation" });
-    }
-    const record = policy as Record<string, unknown>;
-    const version = record.version ?? 1;
-    if (version !== 1) {
-      throw unprocessable("Breakdown carryOverPolicy version is unsupported", {
-        code: "validation",
-        version,
-      });
-    }
-    const mode = record.mode ?? "all_except";
-    if (mode !== "all_except" && mode !== "only") {
-      throw unprocessable("Breakdown carryOverPolicy mode must be all_except or only", { code: "validation" });
-    }
-    return {
-      version: 1,
-      mode,
-      includeFields: readStringList(record.includeFields, "Breakdown carryOverPolicy includeFields"),
-      excludeFields: readStringList(record.excludeFields, "Breakdown carryOverPolicy excludeFields"),
-    };
-  }
-  return {
-    version: 1,
-    mode: "only",
-    includeFields: readStringList(raw.inheritFields, "Breakdown inheritFields"),
-    excludeFields: [],
-  };
-}
 
 function isCarryOverIdentityFieldKey(key: string) {
   const normalized = key.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
@@ -740,92 +594,11 @@ function shouldCarryOverField(policy: PipelineCarryOverPolicy, key: string) {
   return !policy.excludeFields.includes(key);
 }
 
-function readBreakdownConfig(config?: PipelineStageConfig | null): PipelineBreakdownConfig | null {
-  const raw = config?.breakdown;
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const targetPipelineId = typeof raw.targetPipelineId === "string" && raw.targetPipelineId.trim()
-    ? raw.targetPipelineId.trim()
-    : null;
-  const targetStageKey = typeof raw.targetStageKey === "string" && raw.targetStageKey.trim()
-    ? raw.targetStageKey.trim()
-    : null;
-  if (!targetPipelineId) throw unprocessable("Breakdown targetPipelineId is required", { code: "validation" });
-  if (!targetStageKey) throw unprocessable("Breakdown targetStageKey is required", { code: "validation" });
-  const pieceNoun = typeof raw.pieceNoun === "string" && raw.pieceNoun.trim()
-    ? raw.pieceNoun.trim()
-    : "piece";
-  const waitForPieces = raw.waitForPieces === undefined
-    ? config?.requireChildrenTerminal === true
-    : raw.waitForPieces === true;
-  const whenFinishedMoveTo = readOptionalStageKey(
-    raw.whenFinishedMoveTo ?? config?.autoAdvanceOnChildrenTerminal,
-    "Breakdown whenFinishedMoveTo",
-  );
-  const carryOverPolicy = readBreakdownCarryOverPolicy(raw);
-  return {
-    targetPipelineId,
-    targetStageKey,
-    pieceNoun,
-    carryOverPolicy,
-    inheritFields: carryOverPolicy.mode === "only" ? carryOverPolicy.includeFields : [],
-    advanceTo: readOptionalStageKey(raw.advanceTo, "Breakdown advanceTo"),
-    waitForPieces,
-    whenFinishedMoveTo,
-  };
-}
 
-function childrenGateConfig(
-  config?: PipelineStageConfig | null,
-  options: { explicitZeroChildrenPass?: boolean } = {},
-) {
-  const breakdown = readBreakdownConfig(config);
-  return {
-    requireChildrenTerminal: breakdown?.waitForPieces ?? config?.requireChildrenTerminal === true,
-    autoAdvanceOnChildrenTerminal: breakdown?.whenFinishedMoveTo ?? (
-      typeof config?.autoAdvanceOnChildrenTerminal === "string" && config.autoAdvanceOnChildrenTerminal.trim()
-        ? config.autoAdvanceOnChildrenTerminal.trim()
-        : null
-    ),
-    explicitZeroChildrenPass: options.explicitZeroChildrenPass === true,
-  };
-}
 
-function readOptionalTrimmedString(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
 
-function readExecutionWorkspacePreference(value: unknown): ExecutionWorkspaceMode | null {
-  const preference = readOptionalTrimmedString(value);
-  switch (preference) {
-    case "inherit":
-    case "shared_workspace":
-    case "isolated_workspace":
-    case "operator_branch":
-    case "reuse_existing":
-    case "agent_default":
-      return preference;
-    default:
-      return null;
-  }
-}
 
-function readExecutionWorkspaceSettings(value: unknown): IssueExecutionWorkspaceSettings | null {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? value as IssueExecutionWorkspaceSettings
-    : null;
-}
 
-function readAutomationExecutionContext(
-  source?: Partial<PipelineAutomationExecutionContext> | null,
-): PipelineAutomationExecutionContext {
-  return {
-    projectId: readOptionalTrimmedString(source?.projectId),
-    projectWorkspaceId: readOptionalTrimmedString(source?.projectWorkspaceId),
-    executionWorkspaceId: readOptionalTrimmedString(source?.executionWorkspaceId),
-    executionWorkspacePreference: readExecutionWorkspacePreference(source?.executionWorkspacePreference),
-    executionWorkspaceSettings: readExecutionWorkspaceSettings(source?.executionWorkspaceSettings),
-  };
-}
 
 function readStageAutomationRequest(config?: PipelineStageConfig | null) {
   const automation = config?.automation;
@@ -863,14 +636,6 @@ function resolvePipelineAutomationTitleTemplate(input: {
   return PIPELINE_AUTOMATION_DEFAULT_TITLE_TEMPLATE;
 }
 
-function persistedStageConfig(config?: PipelineStageConfig | null): PipelineStageConfig {
-  const {
-    automation: _automation,
-    assigneeAgentId: _assigneeAgentId,
-    ...rest
-  } = { ...(config ?? {}) } as PipelineStageConfig & { assigneeAgentId?: unknown };
-  return rest as PipelineStageConfig;
-}
 
 function sanitizePipelineRoutineVariables(raw: PipelineStageConfig["variables"]): RoutineVariable[] {
   return sanitizePipelineRoutineVariableRecords(raw).map(({ source: _source, ...variable }) => variable);
@@ -937,148 +702,10 @@ function reconcilePipelineStageConfigVariables(
   };
 }
 
-function normalizeStageConfig(kind: PipelineStageKind | string, config?: PipelineStageConfig | null): PipelineStageConfig {
-  const { reviewerKind, ...rest } = persistedStageConfig(config);
-  const next = rest as PipelineStageConfig;
 
-  if (next.disabled !== undefined && typeof next.disabled !== "boolean") {
-    throw unprocessable("Stage disabled must be boolean", { code: "validation" });
-  }
 
-  if (next.requireApproval !== undefined && typeof next.requireApproval !== "boolean") {
-    throw unprocessable("Stage requireApproval must be boolean", { code: "validation" });
-  }
-  if (next.requireChildrenTerminal !== undefined && typeof next.requireChildrenTerminal !== "boolean") {
-    throw unprocessable("Stage requireChildrenTerminal must be boolean", { code: "validation" });
-  }
-  if (next.requireNoUnresolvedDrift !== undefined && typeof next.requireNoUnresolvedDrift !== "boolean") {
-    throw unprocessable("Stage requireNoUnresolvedDrift must be boolean", { code: "validation" });
-  }
-  if (next.breakdown !== undefined) {
-    if (!next.breakdown || typeof next.breakdown !== "object" || Array.isArray(next.breakdown)) {
-      throw unprocessable("Stage breakdown must be an object", { code: "validation" });
-    }
-    const breakdown = readBreakdownConfig(next);
-    next.breakdown = {
-      ...(next.breakdown as Record<string, unknown>),
-      targetPipelineId: breakdown!.targetPipelineId,
-      targetStageKey: breakdown!.targetStageKey,
-      pieceNoun: breakdown!.pieceNoun,
-      carryOverPolicy: breakdown!.carryOverPolicy,
-      inheritFields: breakdown!.inheritFields,
-      ...(breakdown!.advanceTo ? { advanceTo: breakdown!.advanceTo } : {}),
-      waitForPieces: breakdown!.waitForPieces,
-      ...(breakdown!.whenFinishedMoveTo ? { whenFinishedMoveTo: breakdown!.whenFinishedMoveTo } : {}),
-    };
-  }
 
-  if (reviewerKind !== undefined && reviewerKind !== "human" && reviewerKind !== "any") {
-    throw unprocessable("Review stage reviewerKind must be human or any", { code: "validation" });
-  }
 
-  const legacyRequiresApproval = reviewerKind === "human" ? true : reviewerKind === "any" ? false : undefined;
-  const requireApproval = legacyRequiresApproval ?? next.requireApproval ?? kind === "review";
-  const approver = normalizeStageApprover(next.approver, requireApproval);
-  next.requireApproval = requireApproval;
-  next.approver = approver;
-
-  if (kind !== "review") return next;
-
-  if (typeof next.approveToStageKey !== "string" || next.approveToStageKey.trim().length === 0) {
-    throw unprocessable("Review stages require approveToStageKey", { code: "validation" });
-  }
-  if (typeof next.rejectToStageKey !== "string" || next.rejectToStageKey.trim().length === 0) {
-    throw unprocessable("Review stages require rejectToStageKey", { code: "validation" });
-  }
-  if (
-    next.requestChangesToStageKey !== undefined &&
-    (typeof next.requestChangesToStageKey !== "string" || next.requestChangesToStageKey.trim().length === 0)
-  ) {
-    throw unprocessable("Review stage requestChangesToStageKey must be a non-empty string", { code: "validation" });
-  }
-  if (next.requireRejectReason !== undefined && typeof next.requireRejectReason !== "boolean") {
-    throw unprocessable("Review stage requireRejectReason must be boolean", { code: "validation" });
-  }
-  if (next.requireRequestChangesReason !== undefined && typeof next.requireRequestChangesReason !== "boolean") {
-    throw unprocessable("Review stage requireRequestChangesReason must be boolean", { code: "validation" });
-  }
-  return {
-    ...next,
-    approveToStageKey: next.approveToStageKey.trim(),
-    rejectToStageKey: next.rejectToStageKey.trim(),
-    ...(next.requestChangesToStageKey !== undefined ? { requestChangesToStageKey: next.requestChangesToStageKey.trim() } : {}),
-    requireRejectReason: next.requireRejectReason ?? true,
-    requireRequestChangesReason: next.requireRequestChangesReason ?? true,
-    requireApproval,
-    approver,
-  };
-}
-
-function reviewConfigForStage(stage: typeof pipelineStages.$inferSelect) {
-  const config = normalizeStageConfig(stage.kind, stageConfig(stage));
-  const reviewerKind: PipelineStageConfig["reviewerKind"] = config.requireApproval === true ? "human" : "any";
-  return {
-    ...config,
-    reviewerKind,
-  };
-}
-
-function normalizeStageApprover(
-  approver: PipelineStageConfig["approver"] | undefined,
-  requireApproval: boolean,
-): NonNullable<PipelineStageConfig["approver"]> {
-  if (approver !== undefined && (typeof approver !== "object" || approver === null || Array.isArray(approver))) {
-    throw unprocessable("Stage approver must be an object", { code: "validation" });
-  }
-  const kind = approver?.kind ?? "any_human";
-  if (kind !== "any_human" && kind !== "user" && kind !== "agent") {
-    throw unprocessable("Stage approver kind must be any_human, user, or agent", { code: "validation" });
-  }
-  const id = typeof approver?.id === "string" ? approver.id.trim() : approver?.id;
-  if ((kind === "user" || kind === "agent") && (typeof id !== "string" || id.length === 0)) {
-    throw unprocessable("Specific stage approvers require an id", { code: "validation" });
-  }
-  if (kind === "any_human") {
-    return { kind };
-  }
-  if (!requireApproval) {
-    return { kind, id: id as string };
-  }
-  return { kind, id: id as string };
-}
-
-function assertStageEnabled(stage: typeof pipelineStages.$inferSelect, action: string) {
-  const config = normalizeStageConfig(stage.kind, stageConfig(stage));
-  if (config.disabled !== true) return;
-  throw unprocessable("Pipeline stage is disabled", {
-    code: "stage_disabled",
-    action,
-    stageId: stage.id,
-    stageKey: stage.key,
-  });
-}
-
-function assertActorCanApproveStageExit(stage: typeof pipelineStages.$inferSelect, actor: PipelineActor) {
-  const config = normalizeStageConfig(stage.kind, stageConfig(stage));
-  if (config.requireApproval !== true) return;
-  const approver = config.approver ?? { kind: "any_human" };
-  if (approver.kind === "any_human") {
-    if (actor.type === "user") return;
-    throw new HttpError(403, "Stage approval requires a human approver", { code: "review_required" });
-  }
-  if (approver.kind === "user") {
-    if (actor.type === "user" && actor.userId === approver.id) return;
-    throw new HttpError(403, "Stage approval requires the configured user approver", {
-      code: "review_required",
-      approver,
-    });
-  }
-  if (actor.type === "agent" && actor.agentId === approver.id) return;
-  throw new HttpError(403, "Stage approval requires the configured agent approver", {
-    code: "review_required",
-    approver,
-  });
-}
 
 function assertReviewTargetsInSet(
   kind: PipelineStageKind | string,
@@ -1097,24 +724,7 @@ function assertReviewTargetsInSet(
   }
 }
 
-function targetStageKeyForReviewDecision(config: PipelineStageConfig, decision: PipelineReviewDecision) {
-  if (decision === "approve") return config.approveToStageKey!;
-  if (decision === "reject") return config.rejectToStageKey!;
-  if (!config.requestChangesToStageKey) {
-    throw unprocessable("Review stage does not configure requestChangesToStageKey", { code: "validation" });
-  }
-  return config.requestChangesToStageKey;
-}
 
-function stageAutomation(stage: typeof pipelineStages.$inferSelect) {
-  const onEnter = stageConfig(stage).onEnter;
-  if (!onEnter || onEnter.type !== "run_routine" || !onEnter.routineId) return null;
-  return {
-    id: onEnter.id ?? `${stage.id}:on_enter`,
-    routineId: onEnter.routineId,
-    ...readAutomationExecutionContext(onEnter),
-  };
-}
 
 function stageRef(stage: typeof pipelineStages.$inferSelect) {
   return { id: stage.id, key: stage.key, name: stage.name };
@@ -1291,9 +901,6 @@ function validateFieldsForIntakeStage(stage: typeof pipelineStages.$inferSelect,
   }
 }
 
-function buildCaseDeepLink(input: { pipelineId: string; caseId: string }) {
-  return `/PAP/pipelines/${input.pipelineId}/cases/${input.caseId}`;
-}
 
 function buildPipelineCaseContextPack(input: {
   pipeline: typeof pipelines.$inferSelect;
@@ -1474,605 +1081,28 @@ function buildPipelineCaseContextMarkdown(input: {
   ].filter((line): line is string => line != null).join("\n");
 }
 
-async function writeCaseEvent(
-  db: PipelineDb,
-  input: {
-    companyId: string;
-    caseId: string;
-    type: string;
-    actor: PipelineActor;
-    fromStageId?: string | null;
-    toStageId?: string | null;
-    payload?: Record<string, unknown>;
-  },
-) {
-  const [event] = await db
-    .insert(pipelineCaseEvents)
-    .values({
-      companyId: input.companyId,
-      caseId: input.caseId,
-      type: input.type,
-      ...eventActorPatch(input.actor),
-      fromStageId: input.fromStageId ?? null,
-      toStageId: input.toStageId ?? null,
-      payload: input.payload ?? {},
-    })
-    .returning();
-  return event!;
-}
 
-async function getPipelineOrThrow(db: PipelineDb, companyId: string, pipelineId: string) {
-  const row = await db
-    .select()
-    .from(pipelines)
-    .where(and(eq(pipelines.id, pipelineId), eq(pipelines.companyId, companyId)))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-  if (!row) throw notFound("Pipeline not found");
-  return row;
-}
 
-async function getStageOrThrow(db: PipelineDb, pipelineId: string, stageId: string) {
-  const row = await db
-    .select()
-    .from(pipelineStages)
-    .where(and(eq(pipelineStages.id, stageId), eq(pipelineStages.pipelineId, pipelineId)))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-  if (!row) throw notFound("Pipeline stage not found");
-  return row;
-}
 
-async function getStageByKeyOrThrow(db: PipelineDb, pipelineId: string, key: string) {
-  const row = await db
-    .select()
-    .from(pipelineStages)
-    .where(and(eq(pipelineStages.pipelineId, pipelineId), eq(pipelineStages.key, key)))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-  if (!row) throw notFound("Pipeline stage not found");
-  return row;
-}
 
-async function getCaseWithStageOrThrow(db: PipelineDb, companyId: string, caseId: string) {
-  const row = await db
-    .select({ case: pipelineCases, stage: pipelineStages, pipeline: pipelines })
-    .from(pipelineCases)
-    .innerJoin(pipelineStages, eq(pipelineCases.stageId, pipelineStages.id))
-    .innerJoin(pipelines, eq(pipelineCases.pipelineId, pipelines.id))
-    .where(and(eq(pipelineCases.id, caseId), eq(pipelineCases.companyId, companyId), eq(pipelines.companyId, companyId)))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-  if (!row) throw notFound("Pipeline case not found");
-  return row;
-}
 
-async function getCaseWithStageForUpdateOrThrow(db: PipelineDb, companyId: string, caseId: string) {
-  const locked = await db.execute(sql<{ id: string }>`
-    select id from pipeline_cases
-    where company_id = ${companyId} and id = ${caseId}
-    for update
-  `);
-  if (Array.from(locked).length === 0) throw notFound("Pipeline case not found");
-  return getCaseWithStageOrThrow(db, companyId, caseId);
-}
 
-async function expireLeaseIfNeeded(db: PipelineDb, row: typeof pipelineCases.$inferSelect, actor: PipelineActor) {
-  const now = nowDate();
-  if (!row.leaseToken || !row.leaseExpiresAt || row.leaseExpiresAt.getTime() > now.getTime()) {
-    return row;
-  }
 
-  const [updated] = await db
-    .update(pipelineCases)
-    .set({
-      leaseOwnerType: null,
-      leaseAgentId: null,
-      leaseUserId: null,
-      leaseToken: null,
-      leaseExpiresAt: null,
-      updatedAt: now,
-    })
-    .where(and(eq(pipelineCases.id, row.id), eq(pipelineCases.leaseToken, row.leaseToken)))
-    .returning();
-  if (!updated) return row;
 
-  await writeCaseEvent(db, {
-    companyId: row.companyId,
-    caseId: row.id,
-    type: "lease_expired",
-    actor,
-    payload: { previousOwner: leaseOwner(row), expiredAt: now.toISOString() },
-  });
-  return updated;
-}
 
-async function assertLeaseAvailable(
-  db: PipelineDb,
-  row: typeof pipelineCases.$inferSelect,
-  actor: PipelineActor,
-  leaseToken?: string | null,
-) {
-  const current = await expireLeaseIfNeeded(db, row, { type: "system" });
-  if (hasValidLease(current) && !actorOwnsLease(current, actor, leaseToken)) {
-    throw conflict("Pipeline case lease is held", { code: "lease_held", lease: leaseOwner(current) });
-  }
-  return current;
-}
 
-async function assertNoOpenBlockers(db: PipelineDb, row: typeof pipelineCases.$inferSelect, toStage: typeof pipelineStages.$inferSelect) {
-  if (toStage.kind !== "working" && toStage.kind !== "done") return;
-  const blockers = await db
-    .select({
-      id: pipelineCases.id,
-      caseKey: pipelineCases.caseKey,
-      title: pipelineCases.title,
-      terminalKind: pipelineCases.terminalKind,
-    })
-    .from(pipelineCaseBlockers)
-    .innerJoin(pipelineCases, eq(pipelineCaseBlockers.blockedByCaseId, pipelineCases.id))
-    .where(
-      and(
-        eq(pipelineCaseBlockers.companyId, row.companyId),
-        eq(pipelineCaseBlockers.caseId, row.id),
-        or(isNull(pipelineCases.terminalKind), ne(pipelineCases.terminalKind, "done")),
-      ),
-    );
-  if (blockers.length > 0) {
-    throw conflict("Pipeline case is blocked", { code: "blocked", blockers });
-  }
-}
 
-async function getCaseOrThrow(db: PipelineDb, companyId: string, caseId: string) {
-  const row = await db
-    .select()
-    .from(pipelineCases)
-    .where(and(eq(pipelineCases.id, caseId), eq(pipelineCases.companyId, companyId)))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-  if (!row) throw notFound("Pipeline case not found");
-  return row;
-}
 
-async function assertValidParentCase(
-  db: PipelineDb,
-  input: { companyId: string; caseId?: string | null; parentCaseId?: string | null },
-) {
-  if (!input.parentCaseId) return null;
-  if (input.caseId && input.parentCaseId === input.caseId) {
-    throw conflict("Pipeline case parent cycle detected", { code: "parent_cycle" });
-  }
 
-  const parent = await getCaseOrThrow(db, input.companyId, input.parentCaseId);
-  let current = parent;
-  let depth = 1;
-  while (current.parentCaseId) {
-    if (input.caseId && current.parentCaseId === input.caseId) {
-      throw conflict("Pipeline case parent cycle detected", { code: "parent_cycle" });
-    }
-    if (depth >= 32) {
-      throw unprocessable("Pipeline case parent depth exceeds 32", { code: "parent_depth_exceeded" });
-    }
-    current = await getCaseOrThrow(db, input.companyId, current.parentCaseId);
-    depth += 1;
-  }
-  if (depth >= 32) {
-    throw unprocessable("Pipeline case parent depth exceeds 32", { code: "parent_depth_exceeded" });
-  }
-  return parent;
-}
 
-async function adjustParentCounts(
-  db: PipelineDb,
-  input: { parentCaseId: string | null | undefined; childDelta?: number; terminalChildDelta?: number },
-) {
-  if (!input.parentCaseId) return;
-  const patch: Partial<typeof pipelineCases.$inferInsert> = { updatedAt: nowDate() };
-  if (input.childDelta) {
-    patch.childCount = sql`${pipelineCases.childCount} + ${input.childDelta}` as unknown as number;
-  }
-  if (input.terminalChildDelta) {
-    patch.terminalChildCount = sql`${pipelineCases.terminalChildCount} + ${input.terminalChildDelta}` as unknown as number;
-  }
-  if (!input.childDelta && !input.terminalChildDelta) return;
-  await db.update(pipelineCases).set(patch).where(eq(pipelineCases.id, input.parentCaseId));
-}
 
-async function computeCaseRollup(db: PipelineDb, companyId: string, caseId: string) {
-  const rows = await db.execute(sql<{
-    id: string;
-    terminal_kind: string | null;
-  }>`
-    with recursive subtree as (
-      select id, terminal_kind from pipeline_cases where company_id = ${companyId} and id = ${caseId}
-      union all
-      select child.id, child.terminal_kind
-      from pipeline_cases child
-      join subtree parent on child.parent_case_id = parent.id
-      where child.company_id = ${companyId}
-    )
-    select id, terminal_kind from subtree
-  `);
-  const items = Array.from(rows);
-  if (items.length === 0) throw notFound("Pipeline case not found");
-  const descendants = items.slice(1);
-  const done = descendants.filter((item) => item.terminal_kind === "done").length;
-  const cancelled = descendants.filter((item) => item.terminal_kind === "cancelled").length;
-  const open = descendants.filter((item) => item.terminal_kind !== "done" && item.terminal_kind !== "cancelled").length;
-  return { total: descendants.length, done, cancelled, open, complete: open === 0 };
-}
 
-async function hasBlockersResolvedForLatestBlockerSet(db: PipelineDb, caseId: string) {
-  const latestBlockersSet = await db
-    .select({ createdAt: pipelineCaseEvents.createdAt })
-    .from(pipelineCaseEvents)
-    .where(and(eq(pipelineCaseEvents.caseId, caseId), eq(pipelineCaseEvents.type, "blockers_set")))
-    .orderBy(desc(pipelineCaseEvents.createdAt))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
 
-  const row = await db
-    .select({ id: pipelineCaseEvents.id })
-    .from(pipelineCaseEvents)
-    .where(and(
-      eq(pipelineCaseEvents.caseId, caseId),
-      eq(pipelineCaseEvents.type, "blockers_resolved"),
-      latestBlockersSet ? sql`${pipelineCaseEvents.createdAt} > ${latestBlockersSet.createdAt.toISOString()}` : undefined,
-    ))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-  return Boolean(row);
-}
 
-async function hasChildrenTerminalEventForRollup(
-  db: PipelineDb,
-  caseId: string,
-  stageId: string,
-  rollup: Awaited<ReturnType<typeof computeCaseRollup>>,
-) {
-  const stageEntry = await db
-    .select({ createdAt: pipelineCaseEvents.createdAt })
-    .from(pipelineCaseEvents)
-    .where(and(
-      eq(pipelineCaseEvents.caseId, caseId),
-      inArray(pipelineCaseEvents.type, ["ingested", "transitioned", "automation_retry_dispatched"]),
-      eq(pipelineCaseEvents.toStageId, stageId),
-    ))
-    .orderBy(desc(pipelineCaseEvents.createdAt))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-  const row = await db
-    .select({ id: pipelineCaseEvents.id })
-    .from(pipelineCaseEvents)
-    .where(and(
-      eq(pipelineCaseEvents.caseId, caseId),
-      eq(pipelineCaseEvents.type, "children_terminal"),
-      sql`${pipelineCaseEvents.payload} -> 'rollup' = ${JSON.stringify(rollup)}::jsonb`,
-      stageEntry ? sql`${pipelineCaseEvents.createdAt} > ${stageEntry.createdAt.toISOString()}::timestamptz` : undefined,
-    ))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-  return Boolean(row);
-}
 
-function expectedChildrenFromFields(fields: Record<string, unknown> | null | undefined) {
-  const value = fields?.expectedChildren;
-  if (typeof value === "number" && Number.isInteger(value) && value >= 0) return value;
-  if (typeof value === "string" && /^\d+$/.test(value.trim())) return Number(value.trim());
-  return null;
-}
 
-async function listUnresolvedDriftEvents(db: PipelineDb, input: { companyId: string; caseId: string }) {
-  const latestAck = await db
-    .select({ createdAt: pipelineCaseEvents.createdAt })
-    .from(pipelineCaseEvents)
-    .where(and(
-      eq(pipelineCaseEvents.companyId, input.companyId),
-      eq(pipelineCaseEvents.caseId, input.caseId),
-      eq(pipelineCaseEvents.type, "drift_acknowledged"),
-    ))
-    .orderBy(desc(pipelineCaseEvents.createdAt), desc(pipelineCaseEvents.id))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
 
-  return db
-    .select()
-    .from(pipelineCaseEvents)
-    .where(and(
-      eq(pipelineCaseEvents.companyId, input.companyId),
-      eq(pipelineCaseEvents.caseId, input.caseId),
-      eq(pipelineCaseEvents.type, "upstream_drift"),
-      latestAck ? sql`${pipelineCaseEvents.createdAt} > ${latestAck.createdAt.toISOString()}` : undefined,
-    ))
-    .orderBy(desc(pipelineCaseEvents.createdAt), desc(pipelineCaseEvents.id));
-}
 
-async function assertStageTransitionGates(
-  db: PipelineDb,
-  current: typeof pipelineCases.$inferSelect,
-  fromStage: typeof pipelineStages.$inferSelect,
-  options: { skipChildrenTerminalGate?: boolean } = {},
-) {
-  const config = normalizeStageConfig(fromStage.kind, stageConfig(fromStage));
-  const gate = childrenGateConfig(config);
-  if (gate.requireChildrenTerminal && options.skipChildrenTerminalGate !== true) {
-    const expectedChildren = expectedChildrenFromFields(current.fields);
-    if (expectedChildren !== null && expectedChildren !== current.childCount) {
-      throw conflict("Pipeline expected child count does not match created child cases", {
-        code: "expected_children_mismatch",
-        expectedChildren,
-        childCount: current.childCount,
-      });
-    }
-    if (current.childCount !== current.terminalChildCount) {
-      const openChild = await db
-        .select({
-          id: pipelineCases.id,
-          caseKey: pipelineCases.caseKey,
-          title: pipelineCases.title,
-          terminalKind: pipelineCases.terminalKind,
-        })
-        .from(pipelineCases)
-        .where(and(
-          eq(pipelineCases.companyId, current.companyId),
-          eq(pipelineCases.parentCaseId, current.id),
-          isNull(pipelineCases.terminalKind),
-        ))
-        .orderBy(asc(pipelineCases.createdAt))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
-      throw conflict(
-        openChild
-          ? `Pipeline child case "${openChild.title}" is still open`
-          : "Pipeline child cases are not all terminal",
-        {
-          code: "children_not_terminal",
-          childCount: current.childCount,
-          terminalChildCount: current.terminalChildCount,
-          child: openChild,
-        },
-      );
-    }
-  }
-
-  if (config.requireNoUnresolvedDrift === true) {
-    const unresolvedDrift = await listUnresolvedDriftEvents(db, {
-      companyId: current.companyId,
-      caseId: current.id,
-    });
-    if (unresolvedDrift.length > 0) {
-      const first = unresolvedDrift[0]!;
-      const payload = first.payload as Record<string, unknown>;
-      const upstream = typeof payload.upstreamCaseKey === "string"
-        ? payload.upstreamCaseKey
-        : typeof payload.upstreamCaseId === "string"
-          ? payload.upstreamCaseId
-          : "upstream case";
-      throw conflict(`Pipeline upstream change from "${upstream}" is not acknowledged`, {
-        code: "unresolved_drift",
-        driftEventId: first.id,
-        upstreamCaseId: typeof payload.upstreamCaseId === "string" ? payload.upstreamCaseId : null,
-        upstreamCaseKey: typeof payload.upstreamCaseKey === "string" ? payload.upstreamCaseKey : null,
-      });
-    }
-  }
-}
-
-async function assertLatestReviewApprovalStillCurrent(
-  db: PipelineDb,
-  current: typeof pipelineCases.$inferSelect,
-  fromStage: typeof pipelineStages.$inferSelect,
-  toStage: typeof pipelineStages.$inferSelect,
-  options: { allowWorkflowVersionDrift?: boolean } = {},
-) {
-  if (fromStage.kind === "review" || toStage.kind !== "done") return;
-  const latestApproval = await db
-    .select()
-    .from(pipelineCaseEvents)
-    .where(and(
-      eq(pipelineCaseEvents.companyId, current.companyId),
-      eq(pipelineCaseEvents.caseId, current.id),
-      eq(pipelineCaseEvents.type, "review_decided"),
-      sql`${pipelineCaseEvents.payload}->>'decision' = 'approve'`,
-    ))
-    .orderBy(desc(pipelineCaseEvents.createdAt), desc(pipelineCaseEvents.id))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-  if (!latestApproval) return;
-  const payload = latestApproval.payload as Record<string, unknown>;
-  const approvedVersion = typeof payload.approvedTransitionVersion === "number"
-    ? payload.approvedTransitionVersion
-    : typeof payload.approvedCaseVersion === "number"
-      ? payload.approvedCaseVersion
-      : null;
-  if (approvedVersion === null || approvedVersion === current.version) return;
-  if (options.allowWorkflowVersionDrift) {
-    const materialUpdate = await db
-      .select({ id: pipelineCaseEvents.id })
-      .from(pipelineCaseEvents)
-      .where(and(
-        eq(pipelineCaseEvents.companyId, current.companyId),
-        eq(pipelineCaseEvents.caseId, current.id),
-        eq(pipelineCaseEvents.type, "updated"),
-        sql`${pipelineCaseEvents.createdAt} > ${latestApproval.createdAt.toISOString()}`,
-        sql`${pipelineCaseEvents.payload}->>'materialChanged' = 'true'`,
-      ))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    if (!materialUpdate) return;
-  }
-  throw conflict("Pipeline case changed since review approval; send it back through review before publishing", {
-    code: "review_outdated",
-    reviewEventId: latestApproval.id,
-    approvedVersion,
-    currentVersion: current.version,
-  });
-}
-
-async function postSystemCommentOnLinkedIssues(
-  db: PipelineDb,
-  input: {
-    companyId: string;
-    caseId: string;
-    roles: Array<"origin" | "conversation" | "work" | "automation">;
-    body: string;
-  },
-) {
-  const rows = await db
-    .select({ issueId: issues.id })
-    .from(pipelineCaseIssueLinks)
-    .innerJoin(issues, eq(pipelineCaseIssueLinks.issueId, issues.id))
-    .where(and(
-      eq(pipelineCaseIssueLinks.companyId, input.companyId),
-      eq(pipelineCaseIssueLinks.caseId, input.caseId),
-      inArray(pipelineCaseIssueLinks.role, input.roles),
-      ne(issues.status, "done"),
-      ne(issues.status, "cancelled"),
-      visibleIssueCondition(),
-    ));
-
-  for (const row of rows) {
-    await db.insert(issueComments).values({
-      companyId: input.companyId,
-      issueId: row.issueId,
-      authorType: "system",
-      body: input.body,
-    });
-    await db.update(issues).set({ updatedAt: nowDate() }).where(eq(issues.id, row.issueId));
-  }
-}
-
-async function getAncestorCases(db: PipelineDb, companyId: string, parentCaseId: string | null | undefined) {
-  const ancestors: Array<{
-    case: typeof pipelineCases.$inferSelect;
-    stage: typeof pipelineStages.$inferSelect;
-  }> = [];
-  let nextId = parentCaseId ?? null;
-  let depth = 0;
-  while (nextId) {
-    if (depth >= 32) break;
-    const row = await getCaseWithStageOrThrow(db, companyId, nextId);
-    ancestors.push(row);
-    nextId = row.case.parentCaseId;
-    depth += 1;
-  }
-  return ancestors;
-}
-
-async function handleBlockersResolved(db: PipelineDb, companyId: string, blockerCaseId: string) {
-  const blockedRows = await db
-    .select({ caseId: pipelineCaseBlockers.caseId })
-    .from(pipelineCaseBlockers)
-    .where(and(eq(pipelineCaseBlockers.companyId, companyId), eq(pipelineCaseBlockers.blockedByCaseId, blockerCaseId)));
-
-  for (const blocked of blockedRows) {
-    const [{ count }] = await db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(pipelineCaseBlockers)
-      .innerJoin(pipelineCases, eq(pipelineCaseBlockers.blockedByCaseId, pipelineCases.id))
-      .where(and(
-        eq(pipelineCaseBlockers.companyId, companyId),
-        eq(pipelineCaseBlockers.caseId, blocked.caseId),
-        or(isNull(pipelineCases.terminalKind), ne(pipelineCases.terminalKind, "done")),
-      ));
-    if ((count ?? 0) > 0 || await hasBlockersResolvedForLatestBlockerSet(db, blocked.caseId)) continue;
-    await writeCaseEvent(db, {
-      companyId,
-      caseId: blocked.caseId,
-      type: "blockers_resolved",
-      actor: { type: "system" },
-      payload: { resolvedByCaseId: blockerCaseId },
-    });
-    await postSystemCommentOnLinkedIssues(db, {
-      companyId,
-      caseId: blocked.caseId,
-      roles: ["work"],
-      body: `Pipeline blockers resolved for case ${blocked.caseId}. The case can be retried now that blocker ${blockerCaseId} is done.`,
-    });
-  }
-}
-
-async function notifyDependentWorkIssuesOfUpstreamContentChange(
-  db: PipelineDb,
-  input: {
-    companyId: string;
-    upstreamCase: typeof pipelineCases.$inferSelect;
-    previousVersion: number;
-    version: number;
-  },
-) {
-  const dependents = await db
-    .select({ dependentCase: pipelineCases })
-    .from(pipelineCaseBlockers)
-    .innerJoin(pipelineCases, eq(pipelineCaseBlockers.caseId, pipelineCases.id))
-    .where(and(
-      eq(pipelineCaseBlockers.companyId, input.companyId),
-      eq(pipelineCaseBlockers.blockedByCaseId, input.upstreamCase.id),
-      eq(pipelineCases.companyId, input.companyId),
-      isNull(pipelineCases.terminalKind),
-    ));
-
-  if (dependents.length === 0) return;
-
-  const dependentCaseIds = dependents.map((row) => row.dependentCase.id);
-  const linkRows = await db
-    .select({ caseId: pipelineCaseIssueLinks.caseId, issueId: issues.id })
-    .from(pipelineCaseIssueLinks)
-    .innerJoin(issues, eq(pipelineCaseIssueLinks.issueId, issues.id))
-    .where(and(
-      eq(pipelineCaseIssueLinks.companyId, input.companyId),
-      inArray(pipelineCaseIssueLinks.caseId, dependentCaseIds),
-      eq(pipelineCaseIssueLinks.role, "work"),
-      eq(issues.companyId, input.companyId),
-      ne(issues.status, "done"),
-      ne(issues.status, "cancelled"),
-      visibleIssueCondition(),
-    ));
-  const issueIdsByCase = new Map<string, string[]>();
-  for (const row of linkRows) {
-    const list = issueIdsByCase.get(row.caseId) ?? [];
-    list.push(row.issueId);
-    issueIdsByCase.set(row.caseId, list);
-  }
-
-  const upstreamLink = buildCaseDeepLink({
-    pipelineId: input.upstreamCase.pipelineId,
-    caseId: input.upstreamCase.id,
-  });
-  const body = `Upstream case [${input.upstreamCase.caseKey}](${upstreamLink}) changed (v${input.previousVersion}→v${input.version}).`;
-
-  const notifiedIssueIds = new Set<string>();
-  for (const { dependentCase } of dependents) {
-    const issueIds = issueIdsByCase.get(dependentCase.id) ?? [];
-    for (const issueId of issueIds) {
-      if (notifiedIssueIds.has(issueId)) continue;
-      notifiedIssueIds.add(issueId);
-      await db.insert(issueComments).values({
-        companyId: input.companyId,
-        issueId,
-        authorType: "system",
-        body,
-      });
-      await db.update(issues).set({ updatedAt: nowDate() }).where(eq(issues.id, issueId));
-    }
-    // The drift event intentionally does not bump the dependent case's
-    // updatedAt: "unresolved drift" is derived as event.createdAt > case.updatedAt.
-    await writeCaseEvent(db, {
-      companyId: input.companyId,
-      caseId: dependentCase.id,
-      type: "upstream_drift",
-      actor: { type: "system" },
-      payload: {
-        upstreamCaseId: input.upstreamCase.id,
-        upstreamCaseKey: input.upstreamCase.caseKey,
-        upstreamPipelineId: input.upstreamCase.pipelineId,
-        previousVersion: input.previousVersion,
-        version: input.version,
-        notifiedIssueIds: issueIds,
-      },
-    });
-  }
-}
 
 async function validateBlockerSet(
   db: PipelineDb,
@@ -2149,42 +1179,6 @@ function pipelineBatchError(error: unknown, fallbackCode = "unknown") {
   };
 }
 
-async function enqueueStageAutomationLedger(
-  db: PipelineDb,
-  input: {
-    companyId: string;
-    caseId: string;
-    stage: typeof pipelineStages.$inferSelect;
-    eventId: string;
-    retryOfExecutionId?: string | null;
-    generation?: number;
-  },
-) {
-  const automation = stageAutomation(input.stage);
-  if (!automation) return null;
-  const [ledger] = await db
-    .insert(pipelineAutomationExecutions)
-    .values({
-      companyId: input.companyId,
-      caseId: input.caseId,
-      automationId: automation.id,
-      triggeringEventId: input.eventId,
-      routineId: automation.routineId,
-      status: "failed",
-      retryOfExecutionId: input.retryOfExecutionId ?? null,
-      generation: input.generation ?? 1,
-      error: "pending_dispatch",
-    })
-    .onConflictDoNothing({
-      target: [
-        pipelineAutomationExecutions.caseId,
-        pipelineAutomationExecutions.automationId,
-        pipelineAutomationExecutions.triggeringEventId,
-      ],
-    })
-    .returning();
-  return ledger ?? null;
-}
 
 async function resolveAutomationAttemptForActorRun(db: PipelineDb, companyId: string, runId?: string | null) {
   if (!runId) return null;
@@ -3102,365 +2096,13 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     return results;
   }
 
-  async function patchCaseContentInTransaction(
-    tx: PipelineDb,
-    input: {
-      companyId: string;
-      caseId: string;
-      title?: string;
-      summary?: string | null;
-      fields?: Record<string, unknown>;
-      parentCaseId?: string | null;
-      workspaceRef?: Record<string, unknown> | null;
-      expectedVersion?: number;
-      leaseToken?: string | null;
-      actor: PipelineActor;
-    },
-  ) {
-    if (input.fields !== undefined) assertJsonSize(input.fields, "fields");
-    const { case: existing, stage } = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
-    const current = await assertLeaseAvailable(tx, existing, input.actor, input.leaseToken);
-    if (input.expectedVersion !== undefined && current.version !== input.expectedVersion) {
-      throw conflict("Pipeline case version conflict", conflictDetailsForCase(current, stage));
-    }
-    if (input.parentCaseId !== undefined) {
-      await assertValidParentCase(tx, {
-        companyId: input.companyId,
-        caseId: current.id,
-        parentCaseId: input.parentCaseId,
-      });
-    }
-    const titleChanged = input.title !== undefined && input.title !== current.title;
-    const summaryChanged = input.summary !== undefined && input.summary !== current.summary;
-    const fieldsChanged = input.fields !== undefined && !isDeepStrictEqual(input.fields, current.fields);
-    const parentCaseChanged = input.parentCaseId !== undefined && input.parentCaseId !== current.parentCaseId;
-    const workspaceRefChanged = input.workspaceRef !== undefined && !isDeepStrictEqual(input.workspaceRef, current.workspaceRef);
-    const materialChanged = titleChanged || summaryChanged || fieldsChanged;
-    const visibleMetadataChanged = titleChanged || summaryChanged;
-    if (!materialChanged && !visibleMetadataChanged && !parentCaseChanged && !workspaceRefChanged) {
-      return { case: current, event: null };
-    }
 
-    const patch: Partial<typeof pipelineCases.$inferInsert> = {
-      updatedAt: nowDate(),
-    };
-    if (materialChanged) patch.version = current.version + 1;
-    if (titleChanged) patch.title = input.title;
-    if (summaryChanged) patch.summary = input.summary;
-    if (fieldsChanged) patch.fields = input.fields;
-    if (parentCaseChanged) patch.parentCaseId = input.parentCaseId;
-    if (workspaceRefChanged) patch.workspaceRef = input.workspaceRef;
-
-    const [updated] = await tx
-      .update(pipelineCases)
-      .set(patch)
-      .where(and(eq(pipelineCases.id, current.id), eq(pipelineCases.version, current.version)))
-      .returning();
-    if (!updated) {
-      const latest = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
-      throw conflict("Pipeline case version conflict", conflictDetailsForCase(latest.case, latest.stage));
-    }
-
-    const event = materialChanged || visibleMetadataChanged || parentCaseChanged
-      ? await writeCaseEvent(tx, {
-        companyId: input.companyId,
-        caseId: updated.id,
-        type: "updated",
-        actor: input.actor,
-        payload: {
-          previousVersion: current.version,
-          version: updated.version,
-          parentCaseChanged,
-          materialChanged,
-          workspaceRefChanged,
-        },
-      })
-      : null;
-    if (parentCaseChanged) {
-      const terminalDelta = isTerminalKind(current.terminalKind) ? 1 : 0;
-      await adjustParentCounts(tx, {
-        parentCaseId: current.parentCaseId,
-        childDelta: -1,
-        terminalChildDelta: -terminalDelta,
-      });
-      await adjustParentCounts(tx, {
-        parentCaseId: input.parentCaseId,
-        childDelta: 1,
-        terminalChildDelta: terminalDelta,
-      });
-      if (isTerminalKind(current.terminalKind)) {
-        await handleChildrenTerminal(tx, input.companyId, input.parentCaseId);
-      }
-    }
-    if (materialChanged) {
-      await notifyDependentWorkIssuesOfUpstreamContentChange(tx, {
-        companyId: input.companyId,
-        upstreamCase: updated,
-        previousVersion: current.version,
-        version: updated.version,
-      });
-    }
-    return { case: updated, event };
-  }
-
-  async function transitionCaseInTransaction(
-    tx: PipelineDb,
-    input: {
-      companyId: string;
-      caseId: string;
-      toStageId?: string;
-      toStageKey?: string;
-      expectedVersion: number;
-      leaseToken?: string | null;
-      actor: PipelineActor;
-      transitionClass?: "manual" | "suggested" | "auto";
-      suggestionId?: string;
-      reason?: string | null;
-      force?: boolean;
-      automationLedgers?: Array<typeof pipelineAutomationExecutions.$inferSelect>;
-      autoAdvanceVisitedStageIds?: Set<string>;
-      skipChildrenTerminalGate?: boolean;
-    },
-  ) {
-    if (input.transitionClass === "auto" && input.actor.type !== "system") {
-      throw unprocessable("Pipeline auto autonomy is not enabled", { code: "autonomy_not_enabled" });
-    }
-    const { case: existing, stage: fromStage, pipeline } = await getCaseWithStageForUpdateOrThrow(tx, input.companyId, input.caseId);
-    if (pipeline.archivedAt) throw unprocessable("Pipeline is archived", { code: "pipeline_archived" });
-    const current = await assertLeaseAvailable(tx, existing, input.actor, input.leaseToken);
-    if (current.version !== input.expectedVersion) {
-      throw conflict("Pipeline case version conflict", conflictDetailsForCase(current, fromStage));
-    }
-
-    const toStage = input.toStageId
-      ? await getStageOrThrow(tx, current.pipelineId, input.toStageId)
-      : await getStageByKeyOrThrow(tx, current.pipelineId, input.toStageKey ?? "");
-    assertStageEnabled(toStage, "transition");
-    if (fromStage.id !== toStage.id) {
-      assertActorCanApproveStageExit(fromStage, input.actor);
-      await assertStageTransitionGates(tx, current, fromStage, { skipChildrenTerminalGate: input.skipChildrenTerminalGate });
-      await assertLatestReviewApprovalStillCurrent(tx, current, fromStage, toStage, {
-        allowWorkflowVersionDrift: input.transitionClass === "auto" && input.reason === "children_terminal",
-      });
-    }
-    const toConfig = stageConfig(toStage);
-    if (toConfig.autonomy === "auto") {
-      throw unprocessable("Pipeline auto autonomy is not enabled", { code: "autonomy_not_enabled" });
-    }
-    let forcedTransition = false;
-    if (pipeline.enforceTransitions && fromStage.id !== toStage.id) {
-      const allowed = await tx
-        .select({ id: pipelineTransitions.id })
-        .from(pipelineTransitions)
-        .where(
-          and(
-            eq(pipelineTransitions.pipelineId, current.pipelineId),
-            eq(pipelineTransitions.fromStageId, fromStage.id),
-            eq(pipelineTransitions.toStageId, toStage.id),
-          ),
-        )
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
-      if (!allowed) {
-        const reason = input.reason?.trim() ?? "";
-        if (input.force !== true || reason.length === 0) {
-          throw conflict("Pipeline transition is not allowed", { code: "transition_not_allowed" });
-        }
-        forcedTransition = true;
-      }
-    }
-    await assertNoOpenBlockers(tx, current, toStage);
-
-    const enteringTerminal = terminalKindForStage(toStage.kind);
-    const [updated] = await tx
-      .update(pipelineCases)
-      .set({
-        stageId: toStage.id,
-        version: current.version + 1,
-        terminalKind: enteringTerminal,
-        terminalAt: enteringTerminal ? nowDate() : null,
-        pendingSuggestion: input.suggestionId === current.pendingSuggestion?.id ? null : current.pendingSuggestion,
-        leaseOwnerType: enteringTerminal ? null : current.leaseOwnerType,
-        leaseAgentId: enteringTerminal ? null : current.leaseAgentId,
-        leaseUserId: enteringTerminal ? null : current.leaseUserId,
-        leaseToken: enteringTerminal ? null : current.leaseToken,
-        leaseExpiresAt: enteringTerminal ? null : current.leaseExpiresAt,
-        updatedAt: nowDate(),
-      })
-      .where(and(eq(pipelineCases.id, current.id), eq(pipelineCases.version, current.version)))
-      .returning();
-    if (!updated) {
-      const latest = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
-      throw conflict("Pipeline case version conflict", conflictDetailsForCase(latest.case, latest.stage));
-    }
-
-    const event = await writeCaseEvent(tx, {
-      companyId: input.companyId,
-      caseId: current.id,
-      type: "transitioned",
-      actor: input.actor,
-      fromStageId: fromStage.id,
-      toStageId: toStage.id,
-      payload: {
-        previousVersion: current.version,
-        version: updated.version,
-        suggestionId: input.suggestionId ?? null,
-        reason: input.reason ?? null,
-        transitionClass: input.transitionClass ?? "manual",
-      },
-    });
-    if (forcedTransition) {
-      await writeCaseEvent(tx, {
-        companyId: input.companyId,
-        caseId: current.id,
-        type: "transition_forced",
-        actor: input.actor,
-        fromStageId: fromStage.id,
-        toStageId: toStage.id,
-        payload: {
-          fromStageId: fromStage.id,
-          toStageId: toStage.id,
-          reason: input.reason!.trim(),
-          actor: eventActorPayload(input.actor),
-        },
-      });
-    }
-    const ledger = await enqueueStageAutomationLedger(tx, {
-      companyId: input.companyId,
-      caseId: current.id,
-      stage: toStage,
-      eventId: event.id,
-    });
-    if (ledger) input.automationLedgers?.push(ledger);
-    const wasTerminal = isTerminalKind(current.terminalKind);
-    const isTerminal = isTerminalKind(updated.terminalKind);
-    if (current.parentCaseId && wasTerminal !== isTerminal) {
-      await adjustParentCounts(tx, {
-        parentCaseId: current.parentCaseId,
-        terminalChildDelta: isTerminal ? 1 : -1,
-      });
-    }
-    if (!wasTerminal && updated.terminalKind === "done") {
-      await handleBlockersResolved(tx, input.companyId, current.id);
-    }
-    if (!wasTerminal && isTerminal) {
-      await handleChildrenTerminal(tx, input.companyId, current.parentCaseId, input.automationLedgers);
-    }
-    if (!isTerminal) {
-      await maybeAutoAdvanceOnStageEntry(tx, {
-        companyId: input.companyId,
-        caseRow: updated,
-        stage: toStage,
-        automationLedgers: input.automationLedgers,
-        visitedStageIds: input.autoAdvanceVisitedStageIds,
-      });
-    }
-    return { case: updated, event, automationLedger: ledger };
-  }
 
   // A case can enter an auto-advance stage after its children are already
   // terminal (e.g. children triaged during review, then the case moves to
   // producing). handleChildrenTerminal only fires when a child transitions,
   // so without this entry-time check the case would strand forever.
-  async function maybeAutoAdvanceOnStageEntry(
-    tx: PipelineDb,
-    input: {
-      companyId: string;
-      caseRow: typeof pipelineCases.$inferSelect;
-      stage: typeof pipelineStages.$inferSelect;
-      automationLedgers?: Array<typeof pipelineAutomationExecutions.$inferSelect>;
-      visitedStageIds?: Set<string>;
-    },
-  ) {
-    const gate = childrenGateConfig(stageConfig(input.stage));
-    const toStageKey = gate.autoAdvanceOnChildrenTerminal;
-    if (!toStageKey) return;
-    const visited = input.visitedStageIds ?? new Set<string>();
-    if (visited.has(input.stage.id)) return;
-    const rollup = await computeCaseRollup(tx, input.companyId, input.caseRow.id);
-    if (!rollup.complete || (rollup.total === 0 && !gate.explicitZeroChildrenPass)) return;
-    const toStage = await getStageByKeyOrThrow(tx, input.caseRow.pipelineId, toStageKey);
-    if (toStage.id === input.stage.id) return;
-    visited.add(input.stage.id);
-    try {
-      assertStageEnabled(toStage, "auto_advance");
-      await transitionCaseInTransaction(tx, {
-        companyId: input.companyId,
-        caseId: input.caseRow.id,
-        toStageKey,
-        expectedVersion: input.caseRow.version,
-        actor: { type: "system" },
-        transitionClass: "auto",
-        reason: "children_terminal",
-        automationLedgers: input.automationLedgers,
-        autoAdvanceVisitedStageIds: visited,
-      });
-    } catch (error) {
-      // Best-effort: an unsatisfied gate (drift, approval) on the chained
-      // advance must not roll back the transition that entered this stage.
-      if (!(error instanceof HttpError)) throw error;
-    }
-  }
 
-  async function handleChildrenTerminal(
-    tx: PipelineDb,
-    companyId: string,
-    parentCaseId: string | null | undefined,
-    automationLedgers?: Array<typeof pipelineAutomationExecutions.$inferSelect>,
-    options: { allowExplicitZeroChildrenPass?: boolean } = {},
-  ) {
-    const ancestors = await getAncestorCases(tx, companyId, parentCaseId);
-    for (const ancestor of ancestors) {
-      const rollup = await computeCaseRollup(tx, companyId, ancestor.case.id);
-      const gate = childrenGateConfig(stageConfig(ancestor.stage), {
-        explicitZeroChildrenPass: options.allowExplicitZeroChildrenPass,
-      });
-      if (
-        !rollup.complete ||
-        (rollup.total === 0 && !gate.explicitZeroChildrenPass) ||
-        await hasChildrenTerminalEventForRollup(tx, ancestor.case.id, ancestor.stage.id, rollup)
-      ) {
-        continue;
-      }
-      await writeCaseEvent(tx, {
-        companyId,
-        caseId: ancestor.case.id,
-        type: "children_terminal",
-        actor: { type: "system" },
-        payload: { rollup },
-      });
-      await postSystemCommentOnLinkedIssues(tx, {
-        companyId,
-        caseId: ancestor.case.id,
-        roles: ["origin", "conversation"],
-        body: `All child cases for pipeline case "${ancestor.case.title}" are terminal. Rollup: ${rollup.done} done, ${rollup.cancelled} cancelled, ${rollup.open} open.`,
-      });
-
-      const toStageKey = gate.autoAdvanceOnChildrenTerminal;
-      if (!toStageKey || isTerminalKind(ancestor.case.terminalKind)) {
-        continue;
-      }
-      try {
-        const toStage = await getStageByKeyOrThrow(tx, ancestor.case.pipelineId, toStageKey);
-        assertStageEnabled(toStage, "auto_advance");
-        if (toStage.id === ancestor.stage.id) continue;
-        await transitionCaseInTransaction(tx, {
-          companyId,
-          caseId: ancestor.case.id,
-          toStageKey,
-          expectedVersion: ancestor.case.version,
-          actor: { type: "system" },
-          transitionClass: "auto",
-          reason: "children_terminal",
-          automationLedgers,
-        });
-      } catch (error) {
-        // Best-effort: an unsatisfied gate (drift, approval, blocker) on the
-        // parent advance must not roll back the child transition that triggered it.
-        if (!(error instanceof HttpError)) throw error;
-      }
-    }
-  }
 
   const service = {
     resolveBreakdownTarget,
@@ -4906,67 +3548,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       actor: PipelineActor;
     }) {
       const automationLedgers: Array<typeof pipelineAutomationExecutions.$inferSelect> = [];
-      const result = await db.transaction(async (tx) => {
-        const detail = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
-        if (detail.stage.kind !== "review") {
-          throw unprocessable("Pipeline case is not in a review stage", { code: "validation" });
-        }
-        const config = reviewConfigForStage(detail.stage);
-        assertActorCanApproveStageExit(detail.stage, input.actor);
-        const reasonRequired =
-          (input.decision === "request_changes" && config.requireRequestChangesReason !== false) ||
-          (input.decision === "reject" && config.requireRejectReason !== false);
-        if (reasonRequired && !input.reason?.trim()) {
-          throw unprocessable("Review decision reason is required", { code: "validation" });
-        }
-        const toStageKey = targetStageKeyForReviewDecision(config, input.decision);
-        const suggestionId = detail.case.pendingSuggestion?.id ?? null;
-        let expectedVersion = input.expectedVersion;
-        let updateEvent: typeof pipelineCaseEvents.$inferSelect | null = null;
-        const hasEdits = input.edits && Object.keys(input.edits).length > 0;
-
-        if (hasEdits) {
-          const updated = await patchCaseContentInTransaction(tx, {
-            companyId: input.companyId,
-            caseId: input.caseId,
-            ...input.edits,
-            expectedVersion,
-            leaseToken: input.leaseToken,
-            actor: input.actor,
-          });
-          expectedVersion = updated.case.version;
-          updateEvent = updated.event;
-        }
-
-        const transitioned = await transitionCaseInTransaction(tx, {
-          companyId: input.companyId,
-          caseId: input.caseId,
-          toStageKey,
-          expectedVersion,
-          leaseToken: input.leaseToken,
-          reason: input.reason,
-          actor: input.actor,
-          automationLedgers,
-        });
-        const reviewEvent = await writeCaseEvent(tx, {
-          companyId: input.companyId,
-          caseId: input.caseId,
-          type: "review_decided",
-          actor: input.actor,
-          fromStageId: detail.stage.id,
-          toStageId: transitioned.case.stageId,
-          payload: {
-            decision: input.decision,
-            reason: input.reason ?? null,
-            suggestionId,
-            updateEventId: updateEvent?.id ?? null,
-            transitionEventId: transitioned.event.id,
-            approvedCaseVersion: input.decision === "approve" ? expectedVersion : null,
-            approvedTransitionVersion: input.decision === "approve" ? transitioned.case.version : null,
-          },
-        });
-        return { ...transitioned, updateEvent, reviewEvent };
-      });
+      const result = await db.transaction((tx) => reviewCaseMutationInTransaction(tx, input, automationLedgers));
       const automationExecutions = await executeAutomationLedgers(automationLedgers, { type: "system" });
       if (result.automationLedger) {
         return {
