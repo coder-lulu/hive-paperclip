@@ -7,6 +7,7 @@ import {
   companies,
   completionContracts,
   createDb,
+  environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -25,6 +26,7 @@ vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClien
 
 import { heartbeatService } from "../services/heartbeat.ts";
 import { recoveryService } from "../services/recovery/service.ts";
+import { environmentRuntimeService } from "../services/environment-runtime.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -110,6 +112,70 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     return { companyId, agentId, failedRunId, runningRunId };
   }
 
+  it("external lifecycle never releases Hive environment leases through local cleanup", async () => {
+    const { companyId, agentId, runningRunId } = await seed();
+    await db.update(heartbeatRuns).set({ driverKind: "hive_runtime" }).where(eq(heartbeatRuns.id, runningRunId));
+    const environmentRuntime = environmentRuntimeService(db);
+    const release = vi.spyOn(environmentRuntime, "releaseRunLeases").mockResolvedValue([]);
+    await heartbeatService(db, { environmentRuntime }).releaseEnvironmentLeasesForRun({
+      runId: runningRunId, companyId, agentId, status: "interrupted", providerResourceDisposition: "destroy",
+    });
+    expect(release).not.toHaveBeenCalled();
+    expect(await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runningRunId)))
+      .toEqual([{ status: "running" }]);
+  });
+
+  it("external lifecycle refuses a local bounded retry after the agent changes", async () => {
+    const { failedRunId } = await seed();
+    await db.update(heartbeatRuns).set({ driverKind: "hive_runtime" }).where(eq(heartbeatRuns.id, failedRunId));
+    const heartbeat = heartbeatService(db);
+    await expect(heartbeat.scheduleBoundedRetry(failedRunId, { delayMs: 0 }))
+      .resolves.toMatchObject({ outcome: "not_scheduled", errorCode: "external_execution_owned" });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, failedRunId))).toEqual([]);
+  });
+
+  it("external lifecycle persists operator cancellation metadata without claiming a stopped run", async () => {
+    const { runningRunId } = await seed();
+    await db.update(heartbeatRuns).set({ driverKind: "hive_runtime" }).where(eq(heartbeatRuns.id, runningRunId));
+    await expect(heartbeatService(db).cancelRun(runningRunId, "operator stop", {
+      errorCode: "operator_interrupted", suppressImmediateRecovery: true,
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board-user" },
+    })).resolves.toMatchObject({ status: "running" });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runningRunId));
+    expect(run.contextSnapshot?.externalExecutionControl).toMatchObject({ cancel: {
+      reason: "operator stop", errorCode: "operator_interrupted", suppressImmediateRecovery: true,
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board-user" },
+    } });
+    expect(run.finishedAt).toBeNull();
+    expect(run.resultJson).toBeNull();
+  });
+
+  it("external lifecycle does not count durable cancel intent as cancelled execution", async () => {
+    const { agentId, runningRunId } = await seed();
+    await db.update(heartbeatRuns).set({ driverKind: "hive_runtime" }).where(eq(heartbeatRuns.id, runningRunId));
+    await expect(heartbeatService(db).cancelActiveForAgent(agentId)).resolves.toBe(0);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runningRunId));
+    expect(run.status).toBe("running");
+    expect(run.contextSnapshot?.externalExecutionControl).toMatchObject({ cancel: { errorCode: "agent_paused" } });
+  });
+
+  it("external lifecycle leaves Hive leases out of environment cleanup sweeps", async () => {
+    const { companyId, runningRunId } = await seed();
+    await db.update(heartbeatRuns).set({ driverKind: "hive_runtime", status: "failed" }).where(eq(heartbeatRuns.id, runningRunId));
+    const leaseIds = [randomUUID(), randomUUID()];
+    await db.insert(environmentLeases).values(leaseIds.map((id, index) => ({
+      id, companyId, heartbeatRunId: runningRunId, status: index === 0 ? "active" : "pending_cleanup",
+      updatedAt: new Date(0), metadata: {},
+    })));
+    const environmentRuntime = environmentRuntimeService(db);
+    const teardown = vi.spyOn(environmentRuntime, "retryPendingSandboxTeardown").mockImplementation(async () => { throw new Error("No test provider may be torn down"); });
+    await heartbeatService(db, { environmentRuntime }).reapOrphanedRuns();
+    expect(teardown).not.toHaveBeenCalled();
+    const rows = await db.select().from(environmentLeases).where(eq(environmentLeases.companyId, companyId));
+    expect(rows.find(row => row.id === leaseIds[0])?.status).toBe("active");
+    expect(rows.find(row => row.id === leaseIds[1])?.metadata).toEqual({});
+  });
+
   it("clears lock columns when checkoutRunId points at a terminal heartbeat run", async () => {
     const { companyId, agentId, failedRunId } = await seed();
     const issueId = randomUUID();
@@ -181,6 +247,75 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(row).toEqual({ checkoutRunId: runningRunId, executionRunId: runningRunId });
+  });
+
+  it.each([
+    { issueStatus: "done", runStatus: "running", pid: process.pid },
+    { issueStatus: "cancelled", runStatus: "running", pid: 2_000_000_000 },
+    { issueStatus: "done", runStatus: "succeeded", pid: process.pid },
+  ])("preserves external locks for $issueStatus/$runStatus independent of local PID state", async ({ issueStatus, runStatus, pid }) => {
+    const { companyId, agentId, runningRunId } = await seed();
+    const issueId = randomUUID();
+    await db.update(heartbeatRuns).set({ driverKind: "hive_runtime", status: runStatus, processPid: pid })
+      .where(eq(heartbeatRuns.id, runningRunId));
+    // The agent is now local; its setting must not reclassify the persisted run.
+    await db.update(agents).set({ adapterType: "codex_local" }).where(eq(agents.id, agentId));
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "External execution remains Runtime-owned", status: issueStatus,
+      assigneeAgentId: agentId, checkoutRunId: runningRunId, executionRunId: runningRunId,
+    });
+    const beforeOrphanedRunTerminalWrite = vi.fn();
+
+    await expect(recoveryService(db, { enqueueWakeup: vi.fn(), beforeOrphanedRunTerminalWrite }).sweepStaleIssueLocks())
+      .resolves.toEqual({ cleared: 0, issueIds: [], terminalizedRunIds: [] });
+    expect(beforeOrphanedRunTerminalWrite).not.toHaveBeenCalled();
+    expect(await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runningRunId))).toEqual([{ status: runStatus }]);
+    expect(await db.select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId }).from(issues)
+      .where(eq(issues.id, issueId))).toEqual([{ checkoutRunId: runningRunId, executionRunId: runningRunId }]);
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.stale_lock_cleared"))).toEqual([]);
+    expect(mockTelemetryClient.track).not.toHaveBeenCalled();
+  });
+
+  it("rejects a stale local snapshot at the final run UPDATE after external ownership persists", async () => {
+    const { companyId, agentId, runningRunId } = await seed();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Persisted driver changed before terminal write", status: "done",
+      assigneeAgentId: agentId, checkoutRunId: runningRunId, executionRunId: runningRunId,
+    });
+    const beforeOrphanedRunTerminalWrite = vi.fn(async () => {
+      await db.update(heartbeatRuns).set({ driverKind: "hive_runtime" }).where(eq(heartbeatRuns.id, runningRunId));
+    });
+
+    await expect(recoveryService(db, { enqueueWakeup: vi.fn(), beforeOrphanedRunTerminalWrite }).sweepStaleIssueLocks())
+      .resolves.toEqual({ cleared: 0, issueIds: [], terminalizedRunIds: [] });
+    expect(beforeOrphanedRunTerminalWrite).toHaveBeenCalledOnce();
+    expect(await db.select({ status: heartbeatRuns.status, driverKind: heartbeatRuns.driverKind }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runningRunId))).toEqual([{ status: "running", driverKind: "hive_runtime" }]);
+    expect(mockTelemetryClient.track).not.toHaveBeenCalled();
+  });
+
+  it("rechecks external ownership at the final issue lock UPDATE rather than trusting terminal scan rows", async () => {
+    const { companyId, agentId, failedRunId, runningRunId } = await seed();
+    const issueId = randomUUID();
+    await db.update(heartbeatRuns).set({ processPid: 2_000_000_000 }).where(eq(heartbeatRuns.id, runningRunId));
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Persisted external driver fences lock cleanup", status: "in_progress",
+      assigneeAgentId: agentId, checkoutRunId: failedRunId, executionRunId: runningRunId,
+    });
+    const result = await recoveryService(db, {
+      enqueueWakeup: vi.fn(),
+      beforeOrphanedRunTerminalWrite: async () => {
+        // The failed run was already read as local/terminal by the scan.
+        await db.update(heartbeatRuns).set({ driverKind: "hive_runtime" }).where(eq(heartbeatRuns.id, failedRunId));
+      },
+    }).sweepStaleIssueLocks();
+
+    expect(result).toEqual({ cleared: 0, issueIds: [], terminalizedRunIds: [runningRunId] });
+    expect(await db.select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId }).from(issues)
+      .where(eq(issues.id, issueId))).toEqual([{ checkoutRunId: failedRunId, executionRunId: runningRunId }]);
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.stale_lock_cleared"))).toEqual([]);
   });
 
   it("does not terminalize a session-goal control run solely because its issue is done", async () => {

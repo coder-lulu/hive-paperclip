@@ -49,6 +49,7 @@ export type ReviewParticipantFacts = {
 };
 
 export type ScheduledRetryGateErrorCode =
+  | "external_execution_retained"
   | "agent_not_invokable"
   | "heartbeat_wake_on_demand_disabled"
   | "budget_blocked"

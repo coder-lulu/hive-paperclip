@@ -1,5 +1,6 @@
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
+import { createExternalExecutionLifecycle, isExternalExecutionRun, type ExternalExecutionPort } from "./external-execution.js";
 
 import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-utils";
 import { restoreNativeWorkspaceBestEffort } from "./native-runtime/native-workspace-best-effort.js";
@@ -9288,6 +9289,8 @@ export type HeartbeatEnvironmentRuntime = ReturnType<
 >;
 
 export interface HeartbeatServiceOptions {
+  /** Hive owns provider execution, durable bindings and terminal evidence. */
+  externalExecution?: ExternalExecutionPort;
   /** Test seam before the atomic native runtime handoff. */
   beforeNativeRuntimeSelection?: (runId: string) => Promise<void>;
   /** Test seam immediately before the durable chat-control admission check. */
@@ -9442,6 +9445,29 @@ export function heartbeatService(
   options: HeartbeatServiceOptions = {},
 ) {
   let shutdownInProgress = false;
+  const externalExecution = createExternalExecutionLifecycle({
+    port: options.externalExecution,
+    async persistIntent(run, intent) {
+      const control = JSON.stringify({ ...intent.cancellation, reason: intent.reason, requestedAt: new Date().toISOString() });
+      await db.update(heartbeatRuns).set({
+        contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) ||
+          jsonb_build_object('externalExecutionControl',
+            coalesce(${heartbeatRuns.contextSnapshot}->'externalExecutionControl', '{}'::jsonb) ||
+            jsonb_build_object(${intent.kind}::text, coalesce(
+              ${heartbeatRuns.contextSnapshot}->'externalExecutionControl'->${intent.kind}::text,
+              ${control}::jsonb)))`,
+        updatedAt: new Date(),
+      }).where(and(
+        eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+        eq(heartbeatRuns.driverKind, "hive_runtime"),
+        inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+      ));
+    },
+    onUnavailable(run, action) {
+      logger.warn({ companyId: run.companyId, runId: run.id, action, code: "EXTERNAL_RUNTIME_UNAVAILABLE" },
+        "External execution retained until Hive Runtime ownership and outcome can be verified");
+    },
+  });
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -9523,6 +9549,12 @@ export function heartbeatService(
     pluginWorkerManager: options.pluginWorkerManager,
     environmentRuntime,
   });
+  const localEnvironmentLeaseWriteGuard = sql`not exists (
+    select 1 from heartbeat_runs external_owner
+    where external_owner.id = ${environmentLeases.heartbeatRunId}
+      and external_owner.company_id = ${environmentLeases.companyId}
+      and external_owner.driver_kind = 'hive_runtime'
+  )`;
   const workspaceOperationsSvc = workspaceOperationService(db);
   const liveRunExecutions = {
     has(id: string) {
@@ -10151,7 +10183,7 @@ export function heartbeatService(
     };
   }) {
     const leaseOwnerRun = await getRun(input.runId);
-    if (leaseOwnerRun && isNativeRunnerOwnershipHeld(leaseOwnerRun)) return;
+    if (leaseOwnerRun && (isExternalExecutionRun(leaseOwnerRun) || isNativeRunnerOwnershipHeld(leaseOwnerRun))) return;
     if (input.providerResourceDisposition === "destroy") {
       const closeResult = await (
         options.closeWarmNativeSessionsForRun ??
@@ -12775,6 +12807,8 @@ export function heartbeatService(
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
 
+    if (previousStatus && isExternalExecutionRun(previousStatus)) return null;
+
     // Cancelling a queued run that never acquired provider execution is
     // positive bootstrap evidence. It must not hold unrelated queued messages.
     if (
@@ -12814,7 +12848,7 @@ export function heartbeatService(
               executionStatusDeliveryId: randomUUID(),
               updatedAt: new Date(),
             })
-            .where(eq(heartbeatRuns.id, runId))
+            .where(and(eq(heartbeatRuns.id, runId), sql`${heartbeatRuns.driverKind} is distinct from 'hive_runtime'`))
             .returning()
             .then((rows) => rows[0] ?? null);
 
@@ -12861,6 +12895,10 @@ export function heartbeatService(
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
 
+    if (previousStatus && isExternalExecutionRun(previousStatus)) {
+      return { run: previousStatus, updated: false as const };
+    }
+
     // Cancelling a queued run that never acquired provider execution is
     // positive bootstrap evidence. It must not hold unrelated queued messages.
     if (
@@ -12904,6 +12942,7 @@ export function heartbeatService(
             .where(
               and(
                 eq(heartbeatRuns.id, runId),
+                sql`${heartbeatRuns.driverKind} is distinct from 'hive_runtime'`,
                 inArray(heartbeatRuns.status, fromStatuses),
                 ...(isHeartbeatRunTerminalStatus(status)
                   ? [nativeRunnerOwnershipNotHeldCondition()]
@@ -12945,6 +12984,7 @@ export function heartbeatService(
   async function terminalizeRunOnLeaseRelease(
     run: typeof heartbeatRuns.$inferSelect,
   ): Promise<typeof heartbeatRuns.$inferSelect> {
+    if (isExternalExecutionRun(run)) return run;
     if (isNativeRunnerOwnershipHeld(run)) return run;
     if (isHeartbeatRunTerminalStatus(run.status)) return run;
     if (run.status !== "running" && run.status !== "queued") return run;
@@ -14389,6 +14429,7 @@ export function heartbeatService(
     agent: typeof agents.$inferSelect,
     now: Date,
   ) {
+    if (isExternalExecutionRun(run)) return null;
     // Completion deliveries own their durable bounded retry and reply identity.
     // A second process-loss retry would compete for the same outbox input.
     if (run.contextSnapshot?.wakeReason === CHAT_COMPLETION_WAKE_REASON &&
@@ -14428,6 +14469,7 @@ export function heartbeatService(
     adapterType: string;
     adapterConfig: unknown;
   }) {
+    if (isExternalExecutionRun(input.run)) return false;
     const context = parseObject(input.run.contextSnapshot);
     if (
       context.processTopology === "server_stdio" ||
@@ -14511,6 +14553,9 @@ export function heartbeatService(
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
       .where(eq(heartbeatRuns.status, "running"));
     const snapshotRuns = activeRuns.map(toHotRestartIntentRun);
+    for (const { run } of activeRuns) {
+      if (isExternalExecutionRun(run)) await externalExecution.drain(run, signal);
+    }
     const intentWithVersion = {
       ...intent,
       previousServerVersion: intent.previousServerVersion ?? serverVersion,
@@ -14697,6 +14742,11 @@ export function heartbeatService(
       }
 
       const candidate = toHotRestartIntentRun(current);
+      if (isExternalExecutionRun(current.run)) {
+        await externalExecution.recover(current.run);
+        classify(candidate, "skipped", "external_execution_owned");
+        continue;
+      }
       if (current.run.status !== "running") {
         classify(
           candidate,
@@ -14723,6 +14773,11 @@ export function heartbeatService(
       }
 
       const { run, adapterType } = current;
+      if (isExternalExecutionRun(run)) {
+        await externalExecution.recover(run);
+        classify(candidate, "skipped", "external_execution_owned");
+        continue;
+      }
       const patch = {
         adapterType,
         status: run.status,
@@ -15085,6 +15140,10 @@ export function heartbeatService(
     const restartSuspendedRunIds: string[] = [];
 
     for (const { run, agent } of activeRuns) {
+      if (await externalExecution.drain(run, signal)) {
+        restartSuspendedRunIds.push(run.id);
+        continue;
+      }
       // Shutdown owns only this boot's legacy executions. Expired foreign
       // owners belong to the reaper, not another container's drain.
       if (run.runtimeMode === "legacy" && run.controllerBootId &&
@@ -15275,6 +15334,10 @@ export function heartbeatService(
       delayMs?: number;
     },
   ) {
+    if (isExternalExecutionRun(run)) return {
+      outcome: "not_scheduled" as const, reason: "Hive Runtime owns recovery of this execution.",
+      errorCode: "external_execution_owned" as const, issueId: readNonEmptyString(run.contextSnapshot?.issueId),
+    };
     if (Array.isArray(run.contextSnapshot?.chatCompletionDeliveryIds) &&
         run.contextSnapshot.chatCompletionDeliveryIds.some(id => typeof id === "string")) {
       return { outcome: "not_scheduled" as const, reason: "The completion outbox owns this reply's retry budget and publication identity.",
@@ -15554,13 +15617,21 @@ export function heartbeatService(
             | "issue_cancelled"
             | "issue_terminal_status"
             | "issue_not_in_progress"
-            | "issue_execution_lock_changed";
+            | "issue_execution_lock_changed"
+            | "external_execution_owned";
           issueId: string | null;
           details: Record<string, unknown>;
         };
 
     const scheduleResult = await db.transaction(
       async (tx): Promise<ScheduledRetryTransactionResult> => {
+        if (issueId) await tx.execute(sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`);
+        const [predecessor] = await tx.select({ driverKind: heartbeatRuns.driverKind }).from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id))).for("update");
+        if (predecessor && isExternalExecutionRun(predecessor)) return {
+          outcome: "not_scheduled", reason: "Hive Runtime owns recovery of this execution.",
+          errorCode: "external_execution_owned", issueId, details: {},
+        };
         // All automatic failure paths share the same predecessor claim. A
         // duplicate monitor, restart sweep or wake must reuse its successor.
         if (
@@ -15886,6 +15957,7 @@ export function heartbeatService(
             invocationSource: "automation",
             triggerDetail: "system",
             status: "scheduled_retry",
+            driverKind: agent.adapterType === "hive_runtime" ? "hive_runtime" : null,
             wakeupRequestId: wakeupRequest.id,
             contextSnapshot: retryContextSnapshot,
             ...(hasConversationContinuationPolicy(run.resultJson)
@@ -17215,6 +17287,7 @@ export function heartbeatService(
     run: typeof heartbeatRuns.$inferSelect,
     companyAgents?: AgentOrgRow[],
   ) {
+    if (await externalExecution.recover(run)) return null;
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
     if (!agent) {
@@ -17356,6 +17429,7 @@ export function heartbeatService(
         companyId: run.companyId,
         expectedStatus: "queued",
       });
+      if (staleness.outcome === "external_execution_retained") return null;
       if (staleness.outcome === "cancelled") {
         applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
         logger.info(
@@ -18361,6 +18435,7 @@ export function heartbeatService(
           eq(environmentLeases.id, leaseId),
           eq(environmentLeases.status, "pending_cleanup"),
           sql`${pendingCleanupAttemptsSql()} = ${expectedAttempts}`,
+          localEnvironmentLeaseWriteGuard,
           manualAttempt ? sql`coalesce(${environmentLeases.metadata}->'pendingCleanupManualAttemptId', 'null'::jsonb) is not distinct from ${JSON.stringify(manualAttempt.previousId ?? null)}::jsonb` : undefined,
           pendingCleanupRetryDueSql(Boolean(manualAttempt)),
         ),
@@ -18395,6 +18470,7 @@ export function heartbeatService(
           eq(environmentLeases.id, leaseId),
           eq(environmentLeases.status, "pending_cleanup"),
           sql`${pendingCleanupAttemptsSql()} >= ${PENDING_CLEANUP_SWEEP_ATTEMPT_CAP}`,
+          localEnvironmentLeaseWriteGuard,
           sql`${pendingCleanupCapWarnedSql()} = false`,
         ),
       )
@@ -18420,6 +18496,7 @@ export function heartbeatService(
         and(
           eq(environmentLeases.id, leaseId),
           eq(environmentLeases.status, "pending_cleanup"),
+          localEnvironmentLeaseWriteGuard,
         ),
       );
   }
@@ -18441,6 +18518,7 @@ export function heartbeatService(
         and(
           eq(environmentLeases.id, leaseId),
           eq(environmentLeases.status, "active"),
+          localEnvironmentLeaseWriteGuard,
         ),
       );
   }
@@ -18470,6 +18548,7 @@ export function heartbeatService(
       .where(
         and(
           eq(environmentLeases.status, "active"),
+          localEnvironmentLeaseWriteGuard,
           or(
             isNull(environmentLeases.heartbeatRunId),
             inArray(heartbeatRuns.status, [
@@ -18528,6 +18607,8 @@ export function heartbeatService(
           and(
             eq(environmentLeases.id, lease.id),
             eq(environmentLeases.status, "active"),
+            eq(environmentLeases.companyId, lease.companyId),
+            localEnvironmentLeaseWriteGuard,
           ),
         )
         .returning({ id: environmentLeases.id });
@@ -18589,6 +18670,7 @@ export function heartbeatService(
       .where(
         and(
           eq(environmentLeases.status, "pending_cleanup"),
+          localEnvironmentLeaseWriteGuard,
           opts?.explicitRetry ? eq(environmentLeases.companyId, opts.explicitRetry.companyId) : undefined,
           opts?.explicitRetry ? eq(environmentLeases.heartbeatRunId, opts.explicitRetry.runId) : undefined,
           pendingCleanupRetryDueSql(Boolean(opts?.explicitRetry)),
@@ -18897,6 +18979,31 @@ export function heartbeatService(
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
   }
 
+  async function recoverExternalExecutions() {
+    const observedAt = new Date();
+    let after: string | undefined;
+    let retained = 0;
+    for (;;) {
+      const page = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId,
+        driverKind: heartbeatRuns.driverKind, status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.driverKind, "hive_runtime"),
+        inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+        lte(heartbeatRuns.createdAt, observedAt),
+        after ? gt(heartbeatRuns.id, after) : undefined,
+      )).orderBy(asc(heartbeatRuns.id)).limit(32);
+      if (page.length === 0) break;
+      let index = 0;
+      await Promise.all(Array.from({ length: Math.min(4, page.length) }, async () => {
+        while (index < page.length) {
+          await externalExecution.recover(page[index++]);
+          retained++;
+        }
+      }));
+      after = page[page.length - 1].id;
+    }
+    return { retained };
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -19160,6 +19267,7 @@ export function heartbeatService(
       nativeControllerProcessStartedAt,
       nativeControllerLeaseExpiresAt,
     } of activeRuns) {
+      if (await externalExecution.recover(run)) continue;
       // Authentication timeout requires an explicit ownership resolution, not
       // repeated reattachment or a process-gone guess on subsequent sweeps.
       if (isNativeRunnerOwnershipHeld(run)) continue;
@@ -20098,6 +20206,8 @@ export function heartbeatService(
       nativeRestartRecovery?: NativeRestartRecoveryClaim;
     } = {},
   ) {
+    let run = await getRun(runId);
+    if (!run || await externalExecution.recover(run)) return;
     const attemptStartedAtMs = Date.now();
     let attestedQuestionResponseAtMs: number | null = null;
     if ((await getSchedulingSuppression()).suppressed) {
@@ -20113,8 +20223,6 @@ export function heartbeatService(
     }
 
     let legacyAdapterEntered = false;
-    let run = await getRun(runId);
-    if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {
@@ -20393,6 +20501,7 @@ export function heartbeatService(
             companyId: run.companyId,
             expectedStatus: "running",
           });
+          if (staleness.outcome === "external_execution_retained") return;
           if (staleness.outcome === "cancelled") {
             applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
             return;
@@ -26442,6 +26551,8 @@ export function heartbeatService(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
     options: { suppressImmediateRecovery?: boolean } = {},
   ) {
+    const ownedRun = await getRun(run.id);
+    if (ownedRun && isExternalExecutionRun(ownedRun)) return;
     try {
       const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
         companyId: run.companyId,
@@ -28336,6 +28447,7 @@ export function heartbeatService(
               companyId: agent.companyId,
               agentId,
               invocationSource: source,
+              driverKind: agent.adapterType === "hive_runtime" ? "hive_runtime" : null,
               triggerDetail,
               status: "queued",
               responsibleUserId: await resolveQueuedResponsibleUserId(),
@@ -28608,6 +28720,7 @@ export function heartbeatService(
           companyId: agent.companyId,
           agentId,
           invocationSource: source,
+          driverKind: agent.adapterType === "hive_runtime" ? "hive_runtime" : null,
           triggerDetail,
           status: "queued",
           responsibleUserId: await resolveQueuedResponsibleUserId(),
@@ -29107,6 +29220,11 @@ export function heartbeatService(
   ) {
     let run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
+    if (await externalExecution.cancel(run, reason, {
+      errorCode: options.errorCode ?? "cancelled", resultJson: options.resultJson,
+      eventMessage: options.eventMessage, eventPayload: options.eventPayload,
+      suppressImmediateRecovery: options.suppressImmediateRecovery,
+    })) return getRun(runId);
     const pendingNativeRetry =
       run.runtimeMode === "native" && run.status === "failed"
         ? await db
@@ -29415,7 +29533,12 @@ export function heartbeatService(
         ),
       );
 
+    let retainedExternalRuns = 0;
     for (const run of runs) {
+      if (await externalExecution.cancel(run, reason, { errorCode })) {
+        retainedExternalRuns += 1;
+        continue;
+      }
       const stopOwnership =
         run.runtimeMode !== "native"
           ? captureAdapterStopOwnership(run.id)
@@ -29474,7 +29597,7 @@ export function heartbeatService(
       }
     }
 
-    return runs.length;
+    return runs.length - retainedExternalRuns;
   }
 
   async function cancelPendingWakeupsForAgentsInternal(
@@ -29878,6 +30001,7 @@ export function heartbeatService(
 
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
+    recoverExternalExecutions,
     recoverNativeRunsAfterRestart,
     reapOrphanedRuns,
     sweepOrphanedActiveLeases,

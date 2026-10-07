@@ -2,7 +2,7 @@ import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
 import { claimedAdapterType, hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
@@ -10,15 +10,17 @@ import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { logActivity } from "./activity-log.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { issueService } from "./issues.js";
+import { isExternalExecutionRun } from "./external-execution.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "driverKind" | "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
 ): boolean {
   if (
+    isExternalExecutionRun(run) ||
     run.runtimeMode === "native" ||
     !["failed", "timed_out", "interrupted", "cancelled"].includes(run.status)
   )
@@ -62,6 +64,7 @@ export async function terminalizeLegacyExecution(input: {
   fromStatuses?: string[];
 }) {
   const { db, run, status, patch } = input;
+  if (isExternalExecutionRun(run)) return null;
   const issueId =
     run.nativeIssueId ??
     (typeof run.contextSnapshot?.issueId === "string"
@@ -93,6 +96,7 @@ export async function terminalizeLegacyExecution(input: {
           eq(heartbeatRuns.id, run.id),
           eq(heartbeatRuns.companyId, run.companyId),
           inArray(heartbeatRuns.status, input.fromStatuses ?? [run.status]),
+          or(isNull(heartbeatRuns.driverKind), ne(heartbeatRuns.driverKind, "hive_runtime")),
         ),
       )
       .returning();
@@ -105,12 +109,12 @@ export async function terminalizeLegacyExecution(input: {
           executionAgentNameKey: null,
           executionLockedAt: null,
         })
-        .where(eq(issues.id, task.id));
+        .where(and(eq(issues.id, task.id), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
     if (task?.checkoutRunId === run.id)
       await tx
         .update(issues)
         .set({ checkoutRunId: null })
-        .where(eq(issues.id, task.id));
+        .where(and(eq(issues.id, task.id), eq(issues.companyId, run.companyId), eq(issues.checkoutRunId, run.id)));
     const review = task?.status === "in_review" ? parseIssueExecutionState(task.executionState) : null;
     const isCurrentReviewer = review?.status === "pending" &&
       review.currentParticipant?.type === "agent" && review.currentParticipant.agentId === run.agentId;
@@ -172,13 +176,13 @@ export async function terminalizeLegacyExecution(input: {
 export async function settleInterruptedNativeBootstrap(
   db: Db, input: { run: Run; providerDispatchStarted: boolean },
 ): Promise<Run | null> {
-  if (input.providerDispatchStarted) return null;
+  if (input.providerDispatchStarted || isExternalExecutionRun(input.run)) return null;
   const issueId = input.run.contextSnapshot?.issueId;
   if (typeof issueId !== "string") return null;
   return db.transaction(async tx => {
     const [task] = await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId))).for("update");
     const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId))).for("update");
-    if (!task || !run || run.runtimeMode !== "legacy" || run.runtimeModeResolvedAt ||
+    if (!task || !run || isExternalExecutionRun(run) || run.runtimeMode !== "legacy" || run.runtimeModeResolvedAt ||
         run.contextSnapshot?.issueId !== task.id ||
         run.status !== "interrupted" || run.errorCode !== "server_shutdown_interrupted" ||
         claimedAdapterType(run) !== "paperclip_runner" || run.processPid || run.processGroupId ||
@@ -204,6 +208,16 @@ export async function settleInterruptedNativeBootstrap(
     const ownedBlock = holds.map(hold => hold.evidence.nativeBootstrapFailureBlock as Record<string, unknown> | undefined)
       .find(receipt => receipt?.runId === run.id && receipt.statusVersion === task.statusVersion &&
         ["todo", "in_progress", "in_review"].includes(String(receipt.previousStatus)));
+    const now = new Date();
+    const [settled] = await tx.update(heartbeatRuns).set({ resultJson: { ...run.resultJson,
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false, preparationSettledAt: now.toISOString() },
+    }, updatedAt: now }).where(and(
+      eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+      or(isNull(heartbeatRuns.driverKind), ne(heartbeatRuns.driverKind, "hive_runtime")),
+    )).returning();
+    if (!settled) return null;
+    // Mutate projections only after the persisted local-run write succeeds.
+    // The locked run remains local throughout this transaction.
     if (task.status === "blocked" && ownedBlock && task.assigneeAgentId === run.agentId &&
         !isSupersededConversationRun(task, run) && !task.executionRunId && !task.checkoutRunId) {
       // Restore only the unchanged projection made by this exact incident.
@@ -211,10 +225,6 @@ export async function settleInterruptedNativeBootstrap(
       // reblocks, reassignment and conversation resets invalidate this receipt.
       await issueService(tx as unknown as Db).update(task.id, { status: String(ownedBlock.previousStatus) }, tx);
     }
-    const now = new Date();
-    const [settled] = await tx.update(heartbeatRuns).set({ resultJson: { ...run.resultJson,
-      executionRecovery: { kind: "bootstrap", providerWorkStarted: false, preparationSettledAt: now.toISOString() },
-    }, updatedAt: now }).where(eq(heartbeatRuns.id, run.id)).returning();
     const resolved = holds.length ? await tx.update(issueRecoveryActions).set({ status: "resolved", outcome: "false_positive",
       resolutionNote: "The interrupted executor finished preparation and cleanup without starting a provider.",
       resolvedAt: now, updatedAt: now,
@@ -222,7 +232,7 @@ export async function settleInterruptedNativeBootstrap(
       // left replay blocked. Preserve its history while correcting that verdict.
       evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', '"allowed"'::jsonb, false) ||
         ${JSON.stringify({ bootstrapPreparationSettledAt: now.toISOString() })}::jsonb`,
-    }).where(inArray(issueRecoveryActions.id, holds.map(hold => hold.id))).returning({ id: issueRecoveryActions.id }) : [];
+    }).where(and(eq(issueRecoveryActions.companyId, run.companyId), inArray(issueRecoveryActions.id, holds.map(hold => hold.id)))).returning({ id: issueRecoveryActions.id }) : [];
     if (resolved.length) await logActivity(tx as unknown as Db, { companyId: run.companyId, actorType: "system", actorId: "system",
       action: "issue.recovery_action_resolved", entityType: "issue", entityId: task.id, agentId: run.agentId, runId: run.id,
       details: { reason: "native_bootstrap_stopped_before_provider", recoveryActionIds: resolved.map(r => r.id) },

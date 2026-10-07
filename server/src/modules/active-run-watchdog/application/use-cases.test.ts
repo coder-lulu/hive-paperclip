@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { isExternalExecutionRun } from "../../../services/external-execution.js";
 import {
   createBuildRunOutputSilence,
   createFoldSourceResolvedRun,
@@ -18,6 +19,7 @@ describe("application", () => {
       id: "run-1",
       companyId: "company-1",
       agentId: "agent-1",
+      driverKind: null,
       status: "running",
       lastOutputAt: null,
       lastOutputSeq: 0,
@@ -104,6 +106,19 @@ describe("application", () => {
       expect(summary).toMatchObject({ level: "snoozed", snoozedUntil });
     });
 
+    it("keeps external output silence available as an informational signal", async () => {
+      const buildRunOutputSilence = createBuildRunOutputSilence({
+        reader: makeReader(),
+        suspicionThresholdMs: SUSPICION_THRESHOLD_MS,
+        criticalThresholdMs: CRITICAL_THRESHOLD_MS,
+      });
+
+      await expect(buildRunOutputSilence(
+        makeRun({ driverKind: "hive_runtime" }),
+        new Date("2026-01-01T05:00:00.000Z"),
+      )).resolves.toMatchObject({ level: "critical", silenceAgeMs: 5 * 60 * 60 * 1000 });
+    });
+
     it("reports not_applicable for a run that is not running", async () => {
       const now = new Date("2026-01-01T05:00:00.000Z");
       const run = makeRun({ status: "succeeded" });
@@ -154,7 +169,7 @@ describe("application", () => {
           return { kind: "folded", evaluationIssueId: null };
         },
       };
-      const foldSourceResolvedRun = createFoldSourceResolvedRun({ writer, processController });
+      const foldSourceResolvedRun = createFoldSourceResolvedRun({ writer, processController, isExternalExecutionRun });
 
       const outcome = await foldSourceResolvedRun({
         run: makeRun({ processPid: 4242 }),
@@ -187,7 +202,7 @@ describe("application", () => {
         },
         foldSourceResolvedRun: async () => ({ kind: "stale" }),
       };
-      const foldSourceResolvedRun = createFoldSourceResolvedRun({ writer, processController });
+      const foldSourceResolvedRun = createFoldSourceResolvedRun({ writer, processController, isExternalExecutionRun });
 
       const outcome = await foldSourceResolvedRun({
         run: makeRun({ processPid: 4242 }),
@@ -202,6 +217,32 @@ describe("application", () => {
 
       expect(outcome).toEqual({ kind: "stale" });
     });
+
+    it.each(["done", "cancelled"])(
+      "retains an external run after source %s even if the agent now uses a local adapter",
+      async (status) => {
+        const cleanupRunProcess = vi.fn();
+        const persistFold = vi.fn();
+        const foldSourceResolvedRun = createFoldSourceResolvedRun({
+          processController: { cleanupRunProcess },
+          writer: { recordDecision: vi.fn(), foldSourceResolvedRun: persistFold },
+          isExternalExecutionRun,
+        });
+
+        await expect(foldSourceResolvedRun({
+          run: makeRun({ driverKind: "hive_runtime", processPid: process.pid }),
+          runningAgentAdapterType: "codex_local",
+          sourceIssue: { ...foldSourceIssue, status },
+          evidence: foldEvidence,
+          existingEvaluation: null,
+          silenceStartedAt: null,
+          silenceAgeMs: null,
+          now: new Date("2026-01-01T05:00:00.000Z"),
+        })).resolves.toEqual({ kind: "stale" });
+        expect(cleanupRunProcess).not.toHaveBeenCalled();
+        expect(persistFold).not.toHaveBeenCalled();
+      },
+    );
   });
 
   function makeDecisionWriter(overrides: Partial<WatchdogWriter> = {}): WatchdogWriter {
@@ -396,7 +437,7 @@ describe("application", () => {
       foldSourceResolvedRun: async () => ({ kind: "folded", evaluationIssueId: null }),
       ...writerOverrides,
     };
-    return createFoldSourceResolvedRun({ writer, processController });
+    return createFoldSourceResolvedRun({ writer, processController, isExternalExecutionRun });
   }
 
   describe("createScanSilentActiveRuns", () => {
@@ -492,6 +533,25 @@ describe("application", () => {
       const result = await scanSilentActiveRuns({ now: new Date("2026-01-01T05:00:00.000Z") });
 
       expect(result).toMatchObject({ scanned: 1, folded: 1, skipped: 0 });
+    });
+
+    it("does not fold external runs with same-run terminal activity after adapter changes", async () => {
+      const persistFold = vi.fn();
+      const run = makeRun({ driverKind: "hive_runtime", sourceIssueId: "issue-1", processPid: process.pid });
+      const scanSilentActiveRuns = createScanSilentActiveRuns({
+        reader: makeReader({
+          findCandidateSilentRuns: async () => [run],
+          findRunningAgent: async () => ({ id: "agent-1", companyId: "company-1", adapterType: "codex_local" }),
+          findSourceIssue: async () => foldSourceIssue,
+          findLatestSameRunTerminalEvidence: async () => foldEvidence,
+        }),
+        foldSourceResolvedRun: makeScanFoldUseCase({ foldSourceResolvedRun: persistFold }),
+        suspicionThresholdMs: SUSPICION_THRESHOLD_MS,
+      });
+
+      await expect(scanSilentActiveRuns({ now: new Date("2026-01-01T05:00:00.000Z") }))
+        .resolves.toMatchObject({ scanned: 1, folded: 0, skipped: 1 });
+      expect(persistFold).not.toHaveBeenCalled();
     });
   });
 });

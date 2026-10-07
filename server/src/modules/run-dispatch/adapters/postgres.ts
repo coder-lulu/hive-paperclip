@@ -1,7 +1,8 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { isExternalExecutionRun } from "../../../services/external-execution.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
-import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -454,6 +455,15 @@ export function createPostgresRunDispatchAdapter(
         `run-dispatch: run ${input.runId} was not found while evaluating retry eligibility`,
       );
     }
+    if (isExternalExecutionRun(run)) {
+      return {
+        allowed: false as const,
+        reason: "External execution is retained for Runtime recovery",
+        errorCode: "external_execution_retained" as const,
+        issueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
+        details: { runId: run.id },
+      };
+    }
     const factsResult = await loadGateFacts(
       {
         runId: run.id,
@@ -487,6 +497,7 @@ export function createPostgresRunDispatchAdapter(
         and(
           eq(heartbeatRuns.status, "scheduled_retry"),
           lte(heartbeatRuns.scheduledRetryAt, input.now),
+          or(isNull(heartbeatRuns.driverKind), ne(heartbeatRuns.driverKind, "hive_runtime")),
           input.cutoff ? gte(heartbeatRuns.createdAt, input.cutoff) : undefined,
         ),
       )
@@ -646,6 +657,7 @@ export function createPostgresRunDispatchAdapter(
           eq(heartbeatRuns.companyId, input.companyId),
           eq(heartbeatRuns.status, "scheduled_retry"),
           lte(heartbeatRuns.scheduledRetryAt, input.now),
+          or(isNull(heartbeatRuns.driverKind), ne(heartbeatRuns.driverKind, "hive_runtime")),
         ),
       )
       .returning();
@@ -688,6 +700,7 @@ export function createPostgresRunDispatchAdapter(
           eq(heartbeatRuns.companyId, input.companyId),
           eq(heartbeatRuns.status, "scheduled_retry"),
           lte(heartbeatRuns.scheduledRetryAt, input.now),
+          or(isNull(heartbeatRuns.driverKind), ne(heartbeatRuns.driverKind, "hive_runtime")),
         ),
       )
       .returning();
@@ -748,6 +761,9 @@ export function createPostgresRunDispatchAdapter(
     const now = input.now;
 
     const promoteLockedRun = async (tx: Db, run: HeartbeatRun) => {
+      if (isExternalExecutionRun(run)) {
+        return { outcome: { outcome: "external_execution_retained" as const }, telemetryRun: null };
+      }
       if (
         run.status !== "scheduled_retry" ||
         !run.scheduledRetryAt ||
@@ -867,6 +883,7 @@ export function createPostgresRunDispatchAdapter(
     expectedStatus: "queued" | "running",
     now: Date,
   ): Promise<CancelStaleQueuedRunOutcome> {
+      if (isExternalExecutionRun(run)) return { outcome: "external_execution_retained" };
       const [row] = await tx
         .update(heartbeatRuns)
         .set({
@@ -892,6 +909,7 @@ export function createPostgresRunDispatchAdapter(
             eq(heartbeatRuns.id, run.id),
             eq(heartbeatRuns.companyId, run.companyId),
             eq(heartbeatRuns.status, expectedStatus),
+            or(isNull(heartbeatRuns.driverKind), ne(heartbeatRuns.driverKind, "hive_runtime")),
           ),
         )
         .returning();
@@ -975,6 +993,7 @@ export function createPostgresRunDispatchAdapter(
     input: CancelStaleQueuedRunInput,
   ): Promise<CancelStaleQueuedRunOutcome> {
     const cancelLockedRun = async (tx: Db, run: HeartbeatRun) => {
+      if (isExternalExecutionRun(run)) return { outcome: "external_execution_retained" as const };
       if (run.status !== input.expectedStatus) return { outcome: "lost_race" as const };
       const { issueId, facts, decision } = await decideCurrentRunStaleness(tx, run, input.now);
       if (!decision.stale || !issueId) {
@@ -982,12 +1001,16 @@ export function createPostgresRunDispatchAdapter(
           // Preserve the authority accepted under the issue/run locks. Later
           // preflight reads can observe a reassignment; they must not turn an
           // assignee comment into a non-assignee subscription-wait exception.
-          await tx.update(heartbeatRuns).set({
+          const [profiled] = await tx.update(heartbeatRuns).set({
             runnerProfileJson: {
               ...parseObject(run.runnerProfileJson),
               aiConnectionNonAssigneeCommentWake: facts.issueAssigneeAgentId !== run.agentId,
             },
-          }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
+          }).where(and(
+            eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+            or(isNull(heartbeatRuns.driverKind), ne(heartbeatRuns.driverKind, "hive_runtime")),
+          )).returning({ id: heartbeatRuns.id });
+          if (!profiled) return { outcome: "external_execution_retained" as const };
         }
         return { outcome: "not_stale" as const };
       }
@@ -1010,6 +1033,9 @@ export function createPostgresRunDispatchAdapter(
     input: DispatchResolvedInteractionInput<T>,
   ): Promise<DispatchResolvedInteractionOutcome<T>> {
     const dispatchLockedRun = async (tx: Db, run: HeartbeatRun) => {
+      if (isExternalExecutionRun(run)) {
+        return { dispatched: false as const, cancellation: { outcome: "external_execution_retained" as const } };
+      }
       if (run.status !== input.expectedStatus) {
         return { dispatched: false as const, cancellation: { outcome: "lost_race" as const } };
       }

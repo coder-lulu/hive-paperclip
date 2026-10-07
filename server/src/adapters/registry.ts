@@ -1008,6 +1008,7 @@ export function requireServerAdapter(type: string): ServerAdapterModule {
 }
 
 export function getServerAdapter(type: string): ServerAdapterModule {
+  if (type === "hive_runtime") return requireServerAdapter(type);
   return findActiveServerAdapter(type) ?? processAdapter;
 }
 

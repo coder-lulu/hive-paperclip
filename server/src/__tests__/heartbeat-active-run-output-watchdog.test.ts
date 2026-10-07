@@ -20,6 +20,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
+import { createPostgresWatchdogAdapter } from "../modules/active-run-watchdog/adapters/postgres.js";
 import {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -422,6 +423,56 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       eq(issues.originKind, "stale_active_run_evaluation"),
     ))).toHaveLength(0);
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, seeded.companyId))).toHaveLength(0);
+  });
+
+  it.each(["done", "cancelled"] as const)("retains external execution when the source is %s and the agent now uses a local adapter", async (sourceStatus) => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const seeded = await seedRunningRun({
+      now, ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000, sourceStatus, sameRunTerminalEvidence: true,
+    });
+    await db.update(heartbeatRuns).set({ driverKind: "hive_runtime", processPid: process.pid })
+      .where(eq(heartbeatRuns.id, seeded.runId));
+    const adapter = createPostgresWatchdogAdapter(db);
+    expect(await adapter.findRunForCompany(seeded.companyId, seeded.runId)).toMatchObject({ driverKind: "hive_runtime" });
+    const { enqueueWakeup, recovery } = createRecovery();
+
+    await expect(recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId }))
+      .resolves.toMatchObject({ scanned: 1, folded: 0, skipped: 1 });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect((await buildSummary(seeded.runId, now)).level).toBe("critical");
+    expect(await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.runId))).toEqual([{ status: "running" }]);
+    expect(await db.select({ executionRunId: issues.executionRunId }).from(issues)
+      .where(eq(issues.id, seeded.issueId))).toEqual([{ executionRunId: seeded.runId }]);
+    expect(await db.select().from(heartbeatRunWatchdogDecisions).where(eq(heartbeatRunWatchdogDecisions.runId, seeded.runId))).toEqual([]);
+    expect(mockedAppendHeartbeatRunEvent).not.toHaveBeenCalled();
+  });
+
+  it("fences a direct fold writer with a stale local snapshot against the persisted external driver", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const seeded = await seedRunningRun({
+      now, ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000, sourceStatus: "done", sameRunTerminalEvidence: true,
+    });
+    const adapter = createPostgresWatchdogAdapter(db);
+    const run = await adapter.findRunForCompany(seeded.companyId, seeded.runId);
+    const sourceIssue = await adapter.findSourceIssue(seeded.companyId, seeded.issueId);
+    const evidence = await adapter.findLatestSameRunTerminalEvidence(seeded.companyId, {
+      runId: seeded.runId, sourceIssueId: seeded.issueId, sourceIssueStatus: "done", evidenceAfter: seeded.startedAt,
+    });
+    if (!run || !sourceIssue || !evidence) throw new Error("Missing source-resolved test fixture");
+    await db.update(heartbeatRuns).set({ driverKind: "hive_runtime" }).where(eq(heartbeatRuns.id, seeded.runId));
+
+    await expect(adapter.foldSourceResolvedRun(seeded.companyId, {
+      run, sourceIssue, evidence, existingEvaluation: null, silenceStartedAt: seeded.startedAt,
+      silenceAgeMs: now.getTime() - seeded.startedAt.getTime(),
+      cleanup: { attempted: false, outcome: "no_process_metadata", adapterType: "codex_local" }, now,
+    })).resolves.toEqual({ kind: "stale" });
+    expect(await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.runId))).toEqual([{ status: "running" }]);
+    expect(await db.select({ executionRunId: issues.executionRunId }).from(issues)
+      .where(eq(issues.id, seeded.issueId))).toEqual([{ executionRunId: seeded.runId }]);
+    expect(await db.select().from(heartbeatRunWatchdogDecisions).where(eq(heartbeatRunWatchdogDecisions.runId, seeded.runId))).toEqual([]);
+    expect(mockedAppendHeartbeatRunEvent).not.toHaveBeenCalled();
   });
 
   it("does not fold or create review work for a terminal source without same-run evidence", async () => {

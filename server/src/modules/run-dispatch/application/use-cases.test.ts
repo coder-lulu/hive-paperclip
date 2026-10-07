@@ -107,6 +107,14 @@ describe("createPromoteScheduledRetry", () => {
 });
 
 describe("createPromoteDueScheduledRetries", () => {
+  it("does not publish or count a retained external retry from a stale due scan", async () => {
+    const dueRuns = [{ runId: "external-run", companyId: "company-1" }];
+    const writer = fakeWriter({ promoteOrCancelDueRetry: vi.fn(async () => ({ outcome: "external_execution_retained" as const })) });
+    await expect(createPromoteDueScheduledRetries({
+      reader: fakeReader(dueRuns), promoteScheduledRetry: createPromoteScheduledRetry({ writer }),
+    })({ cutoff: null })).resolves.toEqual({ promoted: 0, runIds: [], postCommitEffects: [] });
+  });
+
   it("keeps due order and caps a sweep at 50 runs", async () => {
     const dueRuns = Array.from({ length: 75 }, (_, i) => ({
       runId: `run-${i}`,

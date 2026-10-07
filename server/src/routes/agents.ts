@@ -1,4 +1,5 @@
 import { agentFileStore, agentFileTokenFromHash } from "../services/agent-file-store.js";
+import { isExternalExecutionRun } from "../services/external-execution.js";
 import { pipeline } from "node:stream/promises";
 import { resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { listOpenRouterModels } from "../services/openrouter-models.js";
@@ -6968,12 +6969,12 @@ export function agentRoutes(
       },
     });
 
-    if (run) {
+    if (run && (run.status === "cancelled" || (isExternalExecutionRun(run) && ["queued", "running", "scheduled_retry"].includes(run.status)))) {
       await logActivity(db, {
         companyId: run.companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
-        action: "heartbeat.cancelled",
+        action: run.status === "cancelled" ? "heartbeat.cancelled" : "heartbeat.cancel_requested",
         entityType: "heartbeat_run",
         entityId: run.id,
         details: { agentId: run.agentId },

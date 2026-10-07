@@ -4,6 +4,7 @@ export type RunSnapshot = {
   id: string;
   companyId: string;
   agentId: string;
+  driverKind: string | null;
   status: RunStatus;
   lastOutputAt: Date | null;
   lastOutputSeq: number | null;
@@ -72,6 +73,7 @@ export type ScanSilentActiveRunsResult = {
 
 export type RunProcessMetadata = {
   runId: string;
+  driverKind: string | null;
   adapterType: string;
   fallbackPid: number | null;
   fallbackProcessGroupId: number | null;
@@ -80,7 +82,7 @@ export type RunProcessMetadata = {
 export type RunProcessCleanupOutcome =
   | {
       attempted: false;
-      outcome: "skipped_non_local_adapter" | "no_process_metadata" | "not_running";
+      outcome: "skipped_external_execution" | "skipped_non_local_adapter" | "no_process_metadata" | "not_running";
       adapterType: string;
       pid?: number | null;
       processGroupId?: number | null;

@@ -74,6 +74,7 @@ export function createBuildRunOutputSilence(deps: BuildRunOutputSilenceDeps) {
 export type FoldSourceResolvedRunDeps = {
   writer: WatchdogWriter;
   processController: RunProcessController;
+  isExternalExecutionRun: (run: Pick<RunSnapshot, "driverKind">) => boolean;
 };
 
 export type FoldSourceResolvedRunUseCaseInput = {
@@ -89,8 +90,12 @@ export type FoldSourceResolvedRunUseCaseInput = {
 
 export function createFoldSourceResolvedRun(deps: FoldSourceResolvedRunDeps) {
   return async function foldSourceResolvedRun(input: FoldSourceResolvedRunUseCaseInput): Promise<FoldOutcome> {
+    // Task disposition is not proof that the external provider stopped.
+    if (deps.isExternalExecutionRun(input.run)) return { kind: "stale" };
+
     const cleanup = await deps.processController.cleanupRunProcess({
       runId: input.run.id,
+      driverKind: input.run.driverKind,
       adapterType: input.runningAgentAdapterType,
       fallbackPid: input.run.processPid,
       fallbackProcessGroupId: input.run.processGroupId,

@@ -1,4 +1,5 @@
 import type { Db } from "@paperclipai/db";
+import { isExternalExecutionRun } from "../../services/external-execution.js";
 import { createPostgresWatchdogAdapter } from "./adapters/postgres.js";
 import { createProcessAdapter } from "./adapters/process.js";
 import {
@@ -26,6 +27,7 @@ export function createActiveRunWatchdog(db: Db, config: ActiveRunWatchdogConfig)
   const foldSourceResolvedRun = createFoldSourceResolvedRun({
     writer: postgresAdapter,
     processController,
+    isExternalExecutionRun,
   });
 
   return {

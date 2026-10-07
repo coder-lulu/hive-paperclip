@@ -3,6 +3,10 @@ import { runningProcesses } from "../../../adapters/utils.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../../../services/local-service-supervisor.js";
 import { createProcessAdapter } from "./process.js";
 
+vi.mock("../../../middleware/logger.js", () => ({
+  logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
 vi.mock("../../../services/local-service-supervisor.js", () => ({
   isPidAlive: vi.fn(),
   isProcessGroupAlive: vi.fn(),
@@ -27,6 +31,7 @@ describe("adapters", () => {
 
       const outcome = await adapter.cleanupRunProcess({
         runId: "run-1",
+        driverKind: null,
         adapterType: "hermes_gateway",
         fallbackPid: 4242,
         fallbackProcessGroupId: null,
@@ -36,11 +41,32 @@ describe("adapters", () => {
       expect(mockedIsPidAlive).not.toHaveBeenCalled();
     });
 
+    it("never probes or kills a colliding local PID for a persisted external run", async () => {
+      mockedIsPidAlive.mockReturnValue(true);
+      mockedIsProcessGroupAlive.mockReturnValue(true);
+      const adapter = createProcessAdapter();
+
+      const outcome = await adapter.cleanupRunProcess({
+        runId: "run-1",
+        driverKind: "hive_runtime",
+        // The agent changed adapters; its current setting cannot reclassify this run.
+        adapterType: "codex_local",
+        fallbackPid: process.pid,
+        fallbackProcessGroupId: process.pid,
+      });
+
+      expect(outcome).toEqual({ attempted: false, outcome: "skipped_external_execution", adapterType: "codex_local" });
+      expect(mockedIsPidAlive).not.toHaveBeenCalled();
+      expect(mockedIsProcessGroupAlive).not.toHaveBeenCalled();
+      expect(mockedTerminateLocalService).not.toHaveBeenCalled();
+    });
+
     it("reports no_process_metadata when no pid or process group is known", async () => {
       const adapter = createProcessAdapter();
 
       const outcome = await adapter.cleanupRunProcess({
         runId: "run-1",
+        driverKind: null,
         adapterType: "codex_local",
         fallbackPid: null,
         fallbackProcessGroupId: null,
@@ -56,6 +82,7 @@ describe("adapters", () => {
 
       const outcome = await adapter.cleanupRunProcess({
         runId: "run-1",
+        driverKind: null,
         adapterType: "codex_local",
         fallbackPid: 4242,
         fallbackProcessGroupId: null,
@@ -79,6 +106,7 @@ describe("adapters", () => {
 
       const outcome = await adapter.cleanupRunProcess({
         runId: "run-1",
+        driverKind: null,
         adapterType: "codex_local",
         fallbackPid: 4242,
         fallbackProcessGroupId: null,
@@ -102,6 +130,7 @@ describe("adapters", () => {
 
       const outcome = await adapter.cleanupRunProcess({
         runId: "run-1",
+        driverKind: null,
         adapterType: "codex_local",
         fallbackPid: 4242,
         fallbackProcessGroupId: null,
@@ -124,6 +153,7 @@ describe("adapters", () => {
 
       const outcome = await adapter.cleanupRunProcess({
         runId: "run-1",
+        driverKind: null,
         adapterType: "codex_local",
         fallbackPid: null,
         fallbackProcessGroupId: 4242,
@@ -159,6 +189,7 @@ describe("adapters", () => {
 
         const outcome = await adapter.cleanupRunProcess({
           runId: "run-1",
+          driverKind: null,
           adapterType: "codex_local",
           fallbackPid,
           fallbackProcessGroupId,

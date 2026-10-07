@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -10,6 +10,7 @@ import {
 } from "@paperclipai/db";
 import { parseObject } from "../../../adapters/utils.js";
 import { visibleIssueCondition } from "../../../services/issue-visibility.js";
+import { isExternalExecutionRun } from "../../../services/external-execution.js";
 import { logActivity } from "../../../services/activity-log.js";
 import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../../../services/agent-task-run-telemetry.js";
@@ -50,6 +51,7 @@ function toRunSnapshot(row: typeof heartbeatRuns.$inferSelect): RunSnapshot {
     id: row.id,
     companyId: row.companyId,
     agentId: row.agentId,
+    driverKind: row.driverKind,
     status: row.status,
     lastOutputAt: row.lastOutputAt,
     lastOutputSeq: row.lastOutputSeq,
@@ -287,6 +289,8 @@ export function createPostgresWatchdogAdapter(db: Db): WatchdogRunReader & Watch
   }
 
   async function foldSourceResolvedRun(companyId: string, input: FoldSourceResolvedRunInput): Promise<FoldOutcome> {
+    if (isExternalExecutionRun(input.run)) return { kind: "stale" };
+
     const finalRunStatus = input.sourceIssue.status === "cancelled" ? "cancelled" : "succeeded";
     const postCommitIssueActions: IssuePostCommitAction[] = [];
     const resultJson = {
@@ -321,6 +325,8 @@ export function createPostgresWatchdogAdapter(db: Db): WatchdogRunReader & Watch
           eq(heartbeatRuns.id, input.run.id),
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.status, "running"),
+          // A stale snapshot or direct writer call cannot bypass the persisted driver.
+          or(isNull(heartbeatRuns.driverKind), ne(heartbeatRuns.driverKind, "hive_runtime")),
         ))
         .returning();
       if (!updatedRun) return null;

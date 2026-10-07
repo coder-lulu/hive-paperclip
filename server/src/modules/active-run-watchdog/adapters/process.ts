@@ -1,5 +1,6 @@
 import { runningProcesses } from "../../../adapters/utils.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../../../services/local-service-supervisor.js";
+import { isExternalExecutionRun } from "../../../services/external-execution.js";
 import type { RunProcessController } from "../application/ports.js";
 import type { RunProcessCleanupOutcome, RunProcessMetadata } from "../application/types.js";
 
@@ -21,6 +22,10 @@ function isValidPositivePid(value: number | null): value is number {
 export function createProcessAdapter(): RunProcessController {
   return {
     async cleanupRunProcess(input: RunProcessMetadata): Promise<RunProcessCleanupOutcome> {
+      // Numeric PIDs and the agent's current adapter cannot establish ownership.
+      if (isExternalExecutionRun(input)) {
+        return { attempted: false, outcome: "skipped_external_execution", adapterType: input.adapterType };
+      }
       if (!SESSIONED_LOCAL_ADAPTERS.has(input.adapterType)) {
         return { attempted: false, outcome: "skipped_non_local_adapter", adapterType: input.adapterType };
       }

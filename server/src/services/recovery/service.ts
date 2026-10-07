@@ -7,6 +7,7 @@ import {
   LEGACY_DISPOSITION_REPAIR_INSTRUCTION, type LegacyDispositionEpisode,
 } from "./legacy-continuation.js";
 import { hasLiveLegacyController } from "../legacy-controller-lease.js";
+import { isExternalExecutionRun } from "../external-execution.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { isWaitingConversation, settleConversationTurn, deliverConversationComments } from "../agent-conversations.js";
 import {
@@ -19,6 +20,7 @@ import {
   inArray,
   isNotNull,
   isNull,
+  ne,
   not,
   notExists,
   notInArray,
@@ -5853,6 +5855,9 @@ export function recoveryService(
     // retry. Neither is orphaned, so this function must not terminalize them.
     if (run.status !== "running")
       return { terminalized: false, status: run.status };
+    // The Runtime owns external stop evidence; local PIDs and issue status do not.
+    if (isExternalExecutionRun(run))
+      return { terminalized: false, status: run.status };
     // Authentication failure does not prove the retained provider stopped.
     // PID observations and task status edits cannot resolve its ownership.
     if (isNativeRunnerOwnershipHeld(run))
@@ -5948,7 +5953,10 @@ export function recoveryService(
       .where(
         and(
           eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.companyId, run.companyId),
           eq(heartbeatRuns.status, "running"),
+          // Recheck the persisted driver after any ownership change or stale read.
+          or(isNull(heartbeatRuns.driverKind), ne(heartbeatRuns.driverKind, "hive_runtime")),
           eq(heartbeatRuns.runtimeMode, run.runtimeMode),
           nativeRunnerOwnershipNotHeldCondition(),
           // Provider exit is expected while the native coordinator resumes a
@@ -6096,6 +6104,7 @@ export function recoveryService(
         : [];
     const runStatusById = new Map<string, string>();
     for (const row of runRows) runStatusById.set(row.id, row.status);
+    const externalRunIds = new Set(runRows.filter(isExternalExecutionRun).map((row) => row.id));
 
     // Collect the runs that a non-terminal issue still references. Such a run is
     // the live run of an active issue. A different, terminal issue can also hold
@@ -6151,6 +6160,7 @@ export function recoveryService(
 
     const isCleanable = (runId: string | null) => {
       if (!runId) return true;
+      if (externalRunIds.has(runId)) return false;
       const status = runStatusById.get(runId);
       if (!status) return true; // missing run row → no real claim
       return TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
@@ -6176,6 +6186,17 @@ export function recoveryService(
         .where(
           and(
             eq(issues.id, issue.id),
+            eq(issues.companyId, issue.companyId),
+            // External settlement owns its business locks, including terminal rows.
+            // Check current pointers and drivers rather than trusting the scan snapshot.
+            notExists(db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, issues.companyId),
+              eq(heartbeatRuns.driverKind, "hive_runtime"),
+              or(
+                eq(heartbeatRuns.id, issues.checkoutRunId),
+                eq(heartbeatRuns.id, issues.executionRunId),
+              ),
+            ))),
             issue.checkoutRunId
               ? eq(issues.checkoutRunId, issue.checkoutRunId)
               : isNull(issues.checkoutRunId),

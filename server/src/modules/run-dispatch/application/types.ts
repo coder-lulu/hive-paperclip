@@ -42,10 +42,12 @@ export type PromoteScheduledRetryOutcome =
       reason: string;
       errorCode: ScheduledRetryGateErrorCode;
     }
-  | { outcome: "not_promoted" };
+  | { outcome: "not_promoted" }
+  | { outcome: "external_execution_retained" };
 
 export type CancelStaleQueuedRunOutcome =
   | { outcome: "not_stale" }
+  | { outcome: "external_execution_retained" }
   /** The run's status no longer matched the phase the caller expected; a concurrent writer already won. */
   | { outcome: "lost_race" }
   | {
